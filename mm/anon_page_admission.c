@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/anon_page_admission.h>
 #include <linux/capability.h>
+#include <linux/cgroup.h>
+#include <linux/cred.h>
 #include <linux/hashtable.h>
 #include <linux/hrtimer.h>
 #include <linux/mm.h>
@@ -93,13 +95,17 @@ struct admission_policy {
 	int timeout_burst;
 };
 
+struct admission_class {
+	u64 generation;
+	enum admission_role role;
+};
+
 struct admission_identity {
 	struct hlist_node hash;
 	struct list_head expired;
 	struct pid *tgid;
 	u64 expires;
-	u64 generation;
-	enum admission_role role;
+	struct admission_class class;
 };
 
 struct admission_request {
@@ -159,6 +165,12 @@ static struct admission_policy admission_policy = {
 	.timeout_burst = 8,
 };
 
+#ifdef CONFIG_CPUSETS
+/* A nonzero pair selects the experiment classifier exclusively. */
+static unsigned int experiment_uids[2];
+static u64 experiment_generation;
+#endif
+
 static bool admission_enabled;
 static bool admission_sampled;
 static unsigned int admission_roles;
@@ -206,6 +218,47 @@ static struct admission_identity *admission_identity(struct pid *tgid)
 		if (identity->tgid == tgid)
 			return identity;
 	return NULL;
+}
+
+/* Called under admission_lock on enqueue, grant and fault retry. */
+static struct admission_class admission_classify(struct task_struct *task, u64 now)
+{
+	struct admission_identity *identity;
+
+#ifdef CONFIG_CPUSETS
+	if (experiment_uids[0]) {
+		uid_t uid = __kuid_val(task_uid(task));
+		enum admission_role role;
+		struct cgroup *group, *parent;
+		char name[sizeof("foreground")];
+		const char *expected;
+
+		if (uid == experiment_uids[0]) {
+			role = ADMISSION_TOP;
+			expected = "top-app";
+		} else if (uid == experiment_uids[1]) {
+			role = ADMISSION_FGS;
+			expected = "foreground";
+		} else {
+			return (struct admission_class){};
+		}
+
+		rcu_read_lock();
+		group = task_cgroup(task, cpuset_cgrp_id);
+		parent = cgroup_parent(group);
+		if (!parent || cgroup_parent(parent) ||
+		    cgroup_name(group, name, sizeof(name)) >= sizeof(name) ||
+		    strcmp(name, expected))
+			role = ADMISSION_UNCLASSIFIED;
+		rcu_read_unlock();
+		return (struct admission_class){ .generation = experiment_generation,
+						.role = role };
+	}
+#endif
+	identity = admission_identity(task_tgid(task));
+	if (identity && now < identity->expires)
+		return identity->class;
+	return (struct admission_class){};
 }
 
 static struct admission_request *admission_request(struct task_struct *task)
@@ -276,13 +329,13 @@ static void admission_bypass(struct admission_request *request,
 }
 
 static void admission_reclassify(struct admission_request *request,
-				 struct admission_identity *identity)
+				 enum admission_role role)
 {
-	struct list_head *queue = admission_queue(identity->role);
+	struct list_head *queue = admission_queue(role);
 	struct admission_request *entry;
 
 	list_del(&request->list);
-	request->role = identity->role;
+	request->role = role;
 	list_for_each_entry_reverse(entry, queue, list) {
 		if (entry->id < request->id) {
 			list_add(&request->list, &entry->list);
@@ -295,7 +348,7 @@ static void admission_reclassify(struct admission_request *request,
 static void admission_revalidate(u64 now, struct wake_q_head *wake)
 {
 	struct admission_request *request;
-	struct admission_identity *identity;
+	struct admission_class class;
 	int bucket;
 
 	hash_for_each(admission_requests, bucket, request, hash) {
@@ -308,10 +361,11 @@ static void admission_revalidate(u64 now, struct wake_q_head *wake)
 			continue;
 		}
 
-		identity = admission_identity(task_tgid(request->task));
-		if (!identity || now >= identity->expires ||
+		class = admission_classify(request->task, now);
+		if (!class.role ||
 		    (request->state == ADMISSION_GRANTED &&
-		     request->role_generation != identity->generation)) {
+		     (request->role != class.role ||
+		      request->role_generation != class.generation))) {
 			admission_bypass(request, ADMISSION_CANCEL, now, wake);
 			continue;
 		}
@@ -323,9 +377,9 @@ static void admission_revalidate(u64 now, struct wake_q_head *wake)
 			continue;
 		}
 
-		if (request->role != identity->role)
-			admission_reclassify(request, identity);
-		request->role_generation = identity->generation;
+		if (request->role != class.role)
+			admission_reclassify(request, class.role);
+		request->role_generation = class.generation;
 	}
 }
 
@@ -334,12 +388,12 @@ admission_head(enum admission_role role, u64 now, struct wake_q_head *wake)
 {
 	struct list_head *queue = admission_queue(role);
 	struct admission_request *request;
-	struct admission_identity *identity;
+	struct admission_class class;
 
 	while (!list_empty(queue)) {
 		request = list_first_entry(queue, struct admission_request, list);
-		identity = admission_identity(task_tgid(request->task));
-		if (!identity || now >= identity->expires) {
+		class = admission_classify(request->task, now);
+		if (role != class.role || request->role_generation != class.generation) {
 			admission_bypass(request, ADMISSION_CANCEL, now, wake);
 			continue;
 		}
@@ -529,7 +583,7 @@ enum anon_admission_action anon_admission_prepare(struct vm_fault *vmf)
 {
 	enum anon_admission_action action = ANON_ADMISSION_PASS;
 	struct admission_request *request;
-	struct admission_identity *identity;
+	struct admission_class class;
 	bool eligible = admission_fault_eligible(vmf);
 	DEFINE_WAKE_Q(wake);
 	u64 now;
@@ -543,8 +597,8 @@ enum anon_admission_action anon_admission_prepare(struct vm_fault *vmf)
 		goto unlock;
 	}
 
-	identity = admission_identity(task_tgid(current));
-	if (!identity || now >= identity->expires) {
+	class = admission_classify(current, now);
+	if (!class.role) {
 		if (request)
 			admission_bypass(request, ADMISSION_CANCEL, now, &wake);
 		goto unlock;
@@ -555,8 +609,8 @@ enum anon_admission_action anon_admission_prepare(struct vm_fault *vmf)
 			goto unlock;
 		if (admission_queued >= admission_policy.queue_limit ||
 		    list_empty(&admission_free)) {
-			this_cpu_inc(admission_counts[identity->role].events[ADMISSION_PASS]);
-			action = identity->role == ADMISSION_TOP ?
+			this_cpu_inc(admission_counts[class.role].events[ADMISSION_PASS]);
+			action = class.role == ADMISSION_TOP ?
 				 ANON_ADMISSION_MEASURE_TOP : ANON_ADMISSION_MEASURE_FGS;
 			goto unlock;
 		}
@@ -569,11 +623,11 @@ enum anon_admission_action anon_admission_prepare(struct vm_fault *vmf)
 		request->address = vmf->address;
 		request->id = ++admission_request_id;
 		request->epoch = admission_epoch;
-		request->role_generation = identity->generation;
+		request->role_generation = class.generation;
 		request->arrival = now;
 		request->aging = now + admission_policy.aging_us * NSEC_PER_USEC;
 		request->deadline = now + admission_policy.deadline_us * NSEC_PER_USEC;
-		request->role = identity->role;
+		request->role = class.role;
 		request->state = ADMISSION_WAITING;
 		request->retry_pending = false;
 		hash_add(admission_requests, &request->hash, (unsigned long)current);
@@ -587,7 +641,8 @@ enum anon_admission_action anon_admission_prepare(struct vm_fault *vmf)
 	if (request->state == ADMISSION_GRANTED) {
 		if (request->mm == current->mm && request->address == vmf->address &&
 		    request->epoch == admission_epoch && now < request->deadline &&
-		    request->role_generation == identity->generation) {
+		    request->role == class.role &&
+		    request->role_generation == class.generation) {
 			request->state = ADMISSION_IN_ALLOC;
 			request->entered = now;
 			admission_event(request, ADMISSION_ENTER);
@@ -950,6 +1005,53 @@ unlock:
 	return err;
 }
 
+#ifdef CONFIG_CPUSETS
+static int admission_set_experiment(struct ctl_table *table, int write,
+				    void *buffer, size_t *len, loff_t *ppos)
+{
+	char command[32], *first, *second;
+	struct ctl_table copy = *table;
+	unsigned int top, fgs;
+	DEFINE_WAKE_Q(wake);
+	u64 now;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (write && (*ppos || !*len || *len >= sizeof(command)))
+		return -EINVAL;
+	spin_lock(&admission_lock);
+	snprintf(command, sizeof(command), "%u %u", experiment_uids[0],
+		 experiment_uids[1]);
+	spin_unlock(&admission_lock);
+	copy.data = command;
+	err = proc_dostring(&copy, write, buffer, len, ppos);
+	if (err || !write)
+		return err;
+	second = strim(command);
+	first = strsep(&second, " \t");
+	if (!second || kstrtouint(first, 10, &top) ||
+	    kstrtouint(skip_spaces(second), 10, &fgs) ||
+	    (!!top != !!fgs) || (top && top == fgs) ||
+	    top == (uid_t)-1 || fgs == (uid_t)-1)
+		return -EINVAL;
+
+	spin_lock(&admission_lock);
+	if (top != experiment_uids[0] || fgs != experiment_uids[1]) {
+		experiment_uids[0] = top;
+		experiment_uids[1] = fgs;
+		experiment_generation = ++admission_role_generation;
+		admission_epoch++;
+		now = ktime_get_ns();
+		admission_revalidate(now, &wake);
+		admission_dispatch(now, &wake);
+	}
+	spin_unlock(&admission_lock);
+	wake_up_q(&wake);
+	return 0;
+}
+#endif
+
 static int admission_publish_role(struct ctl_table *table, int write,
 				  void *buffer, size_t *len, loff_t *ppos)
 {
@@ -1004,15 +1106,15 @@ static int admission_publish_role(struct ctl_table *table, int write,
 		if (identity)
 			admission_retire_identity(identity, &expired);
 	} else if (identity) {
-		if (identity->role != role) {
-			identity->role = role;
-			identity->generation = ++admission_role_generation;
+		if (identity->class.role != role) {
+			identity->class.role = role;
+			identity->class.generation = ++admission_role_generation;
 		}
 		identity->expires = now + lease_ms * NSEC_PER_MSEC;
 	} else if (admission_roles < ADMISSION_ROLES) {
 		candidate->tgid = get_pid(tgid);
-		candidate->role = role;
-		candidate->generation = ++admission_role_generation;
+		candidate->class.role = role;
+		candidate->class.generation = ++admission_role_generation;
 		candidate->expires = now + lease_ms * NSEC_PER_MSEC;
 		hash_add(admission_identities, &candidate->hash, (unsigned long)tgid);
 		admission_roles++;
@@ -1122,6 +1224,14 @@ static struct ctl_table admission_sysctls[] = {
 		.mode = 0600,
 		.proc_handler = admission_set_policy,
 	},
+#ifdef CONFIG_CPUSETS
+	{
+		.procname = "experiment_uids",
+		.maxlen = 32,
+		.mode = 0600,
+		.proc_handler = admission_set_experiment,
+	},
+#endif
 	{
 		.procname = "role",
 		.maxlen = 64,
