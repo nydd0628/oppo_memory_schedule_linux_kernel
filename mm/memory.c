@@ -39,6 +39,7 @@
  * Aug/Sep 2004 Changed to four level page tables (Andi Kleen)
  */
 
+#include <linux/anon_page_admission.h>
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
@@ -4216,6 +4217,7 @@ out_release:
 static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
+	enum anon_admission_action admission = ANON_ADMISSION_PASS;
 	struct page *page;
 	vm_fault_t ret = 0;
 	pte_t entry;
@@ -4266,7 +4268,14 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	/* Allocate our own private page. */
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
+	if (vmf->flags & FAULT_FLAG_ANON_ADMISSION) {
+		admission = anon_admission_prepare(vmf);
+		if (admission == ANON_ADMISSION_RETRY)
+			return VM_FAULT_RETRY;
+	}
 	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
+	if (admission != ANON_ADMISSION_PASS)
+		anon_admission_finish(admission, !!page);
 	if (!page)
 		goto oom;
 
@@ -5123,8 +5132,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 		 * pte_offset_map() and we can do that through an atomic read
 		 * in C, which is what pmd_trans_unstable() provides.
 		 */
-		if (pmd_devmap_trans_unstable(vmf->pmd))
+		if (pmd_devmap_trans_unstable(vmf->pmd)) {
+			anon_admission_cancel(vmf->flags);
 			return 0;
+		}
 		/*
 		 * A regular pmd is established and it can't morph into a huge
 		 * pmd from under us anymore at this point because we hold the
@@ -5153,10 +5164,11 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!vmf->pte) {
 		if (vma_is_anonymous(vmf->vma))
 			return do_anonymous_page(vmf);
-		else
-			return do_fault(vmf);
+		anon_admission_cancel(vmf->flags);
+		return do_fault(vmf);
 	}
 
+	anon_admission_cancel(vmf->flags);
 	if (!pte_present(vmf->orig_pte))
 		return do_swap_page(vmf);
 
@@ -5232,6 +5244,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 retry_pud:
 	if (pud_none(*vmf.pud) &&
 	    hugepage_vma_check(vma, vm_flags, false, true, true)) {
+		anon_admission_cancel(flags);
 		ret = create_huge_pud(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
@@ -5240,6 +5253,7 @@ retry_pud:
 
 		barrier();
 		if (pud_trans_huge(orig_pud) || pud_devmap(orig_pud)) {
+			anon_admission_cancel(flags);
 
 			/*
 			 * TODO once we support anonymous PUDs: NUMA case and
@@ -5266,6 +5280,7 @@ retry_pud:
 
 	if (pmd_none(*vmf.pmd) &&
 	    hugepage_vma_check(vma, vm_flags, false, true, true)) {
+		anon_admission_cancel(flags);
 		ret = create_huge_pmd(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
@@ -5274,6 +5289,7 @@ retry_pud:
 
 		barrier();
 		if (unlikely(is_swap_pmd(vmf.orig_pmd))) {
+			anon_admission_cancel(flags);
 			VM_BUG_ON(thp_migration_supported() &&
 					  !is_pmd_migration_entry(vmf.orig_pmd));
 			if (is_pmd_migration_entry(vmf.orig_pmd))
@@ -5281,6 +5297,7 @@ retry_pud:
 			return 0;
 		}
 		if (pmd_trans_huge(vmf.orig_pmd) || pmd_devmap(vmf.orig_pmd)) {
+			anon_admission_cancel(flags);
 			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))
 				return do_huge_pmd_numa_page(&vmf);
 

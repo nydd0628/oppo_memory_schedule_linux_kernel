@@ -8,6 +8,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/anon_page_admission.h>
 #include <linux/bitfield.h>
 #include <linux/extable.h>
 #include <linux/kfence.h>
@@ -532,11 +533,12 @@ static bool is_write_abort(unsigned long esr)
 	return (esr & ESR_ELx_WNR) && !(esr & ESR_ELx_CM);
 }
 
-static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
-				   struct pt_regs *regs)
+static int __kprobes do_page_fault_common(unsigned long far, unsigned long esr,
+					 struct pt_regs *regs, bool admission)
 {
 	const struct fault_info *inf;
 	struct mm_struct *mm = current->mm;
+	bool admission_retry;
 	vm_fault_t fault;
 	unsigned long vm_flags;
 	unsigned int mm_flags = FAULT_FLAG_DEFAULT;
@@ -555,6 +557,8 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 
 	if (user_mode(regs))
 		mm_flags |= FAULT_FLAG_USER;
+	if (admission)
+		mm_flags |= FAULT_FLAG_ANON_ADMISSION;
 
 	/*
 	 * vm_flags tells us what bits we must have in vma->vm_flags
@@ -622,6 +626,9 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	if (fault & VM_FAULT_MAJOR)
 		mm_flags |= FAULT_FLAG_TRIED;
 
+	if (admission)
+		anon_admission_wait_fault();
+
 	/* Quick path to respond to signals */
 	if (fault_signal_pending(fault, regs)) {
 		if (!user_mode(regs))
@@ -638,6 +645,8 @@ retry:
 	}
 
 	fault = __do_page_fault(mm, vma, addr, mm_flags, vm_flags, regs);
+	admission_retry = admission && (fault & VM_FAULT_RETRY) &&
+			  anon_admission_wait_fault();
 
 	/* Quick path to respond to signals */
 	if (fault_signal_pending(fault, regs)) {
@@ -651,7 +660,9 @@ retry:
 		return 0;
 
 	if (fault & VM_FAULT_RETRY) {
-		mm_flags |= FAULT_FLAG_TRIED;
+		/* Admission waiting alone is not a major fault. */
+		if (!admission_retry)
+			mm_flags |= FAULT_FLAG_TRIED;
 		goto retry;
 	}
 	mmap_read_unlock(mm);
@@ -712,6 +723,18 @@ done:
 no_context:
 	__do_kernel_fault(addr, esr, regs);
 	return 0;
+}
+
+static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+				   struct pt_regs *regs)
+{
+	bool admission = anon_admission_active() && user_mode(regs) &&
+			 is_write_abort(esr) && !is_el0_instruction_abort(esr);
+	int ret = do_page_fault_common(far, esr, regs, admission);
+
+	if (admission)
+		anon_admission_end_fault();
+	return ret;
 }
 
 static int __kprobes do_translation_fault(unsigned long far,

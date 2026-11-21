@@ -1224,6 +1224,16 @@ config LOCK_MM_AND_FIND_VMA
 	bool
 	depends on !STACK_GROWSUP
 
+config ANON_PAGE_ADMISSION
+	bool "Pressure-aware admission for anonymous write faults"
+	depends on ARM64 && MMU && !NUMA && SYSCTL && PROC_SYSCTL
+	depends on HIGH_RES_TIMERS && VM_EVENT_COUNTERS
+	default y
+	help
+	  Allow a privileged userspace publisher to classify tasks for
+	  pressure-aware admission of private order-0 anonymous write faults.
+	  Admission is disabled at boot and can be enabled through sysctl.
+
 source "mm/damon/Kconfig"
 
 endmenu

@@ -15,6 +15,7 @@
  *          (lots of bits borrowed from Ingo Molnar & Andrew Morton)
  */
 
+#include <linux/anon_page_admission.h>
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
@@ -4350,6 +4351,53 @@ static inline unsigned int gfp_to_alloc_flags_cma(gfp_t gfp_mask,
 #endif
 	return alloc_flags;
 }
+
+#ifdef CONFIG_ANON_PAGE_ADMISSION
+#define ANON_ADMISSION_GFP		(GFP_HIGHUSER_MOVABLE | __GFP_CMA)
+#define ANON_ADMISSION_ALLOC_FLAGS	(IS_ENABLED(CONFIG_CMA) ? ALLOC_CMA : 0)
+
+bool anon_admission_domain_matches(vm_flags_t vm_flags)
+{
+	gfp_t expected = ANON_ADMISSION_GFP | __GFP_ZERO;
+	gfp_t gfp;
+
+	/* Match arm64's alloc_zeroed_user_highpage_movable(). */
+	if (vm_flags & VM_MTE)
+		expected |= __GFP_ZEROTAGS;
+	gfp = current_gfp_context(expected & gfp_allowed_mask);
+
+	return gfp == expected &&
+	       node_isset(0, cpuset_current_mems_allowed) &&
+	       gfp_to_alloc_flags_cma(gfp, ALLOC_WMARK_LOW) ==
+			(ALLOC_WMARK_LOW | ANON_ADMISSION_ALLOC_FLAGS);
+}
+
+bool anon_admission_zone_margin(long *low, long *high)
+{
+	enum zone_type highest = gfp_zone(ANON_ADMISSION_GFP);
+	struct zoneref *ref;
+	struct zone *zone;
+	bool found = false;
+
+	*low = LONG_MIN;
+	*high = LONG_MIN;
+	for_each_zone_zonelist(zone, ref, node_zonelist(0, ANON_ADMISSION_GFP),
+			       highest) {
+		long available;
+
+		if (!managed_zone(zone))
+			continue;
+		available = zone_page_state_snapshot(zone, NR_FREE_PAGES);
+		available -= __zone_watermark_unusable_free(zone, 0,
+						ANON_ADMISSION_ALLOC_FLAGS);
+		available -= READ_ONCE(zone->lowmem_reserve[highest]);
+		*low = max(*low, available - (long)low_wmark_pages(zone));
+		*high = max(*high, available - (long)high_wmark_pages(zone));
+		found = true;
+	}
+	return found;
+}
+#endif
 
 /*
  * get_page_from_freelist goes through the zonelist trying to allocate
