@@ -12,6 +12,9 @@
 #include <linux/page_pinner.h>
 #include <linux/migrate.h>
 #include "internal.h"
+#ifdef CONFIG_FG_PAGE_POOL
+#include "fg_page_pool.h"
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/page_isolation.h>
@@ -569,6 +572,9 @@ int start_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
 			return -EBUSY;
 		}
 	}
+#ifdef CONFIG_FG_PAGE_POOL
+	fg_pool_drain_isolated();
+#endif
 	return 0;
 }
 

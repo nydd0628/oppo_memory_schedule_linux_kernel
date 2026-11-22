@@ -90,6 +90,13 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/mm.h>
 
+#ifdef CONFIG_FG_PAGE_POOL
+#include <linux/fg_page_pool.h>
+#include <trace/events/fg_page_pool.h>
+
+#include "fg_page_pool.h"
+#endif
+
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -1136,20 +1143,20 @@ buddy_merge_likely(unsigned long pfn, unsigned long buddy_pfn,
  * -- nyc
  */
 
-static inline void __free_one_page(struct page *page,
-		unsigned long pfn,
-		struct zone *zone, unsigned int order,
-		int migratetype, fpi_t fpi_flags)
+static inline void __free_one_page_core(struct page *page,
+		unsigned long pfn, struct zone *zone, unsigned int order,
+		int migratetype, fpi_t fpi_flags, bool pool_return)
 {
-	struct capture_control *capc = task_capc(zone);
+	struct capture_control *capc = pool_return ? NULL : task_capc(zone);
 	unsigned long buddy_pfn = 0;
 	unsigned long combined_pfn;
 	struct page *buddy;
 	bool to_tail;
 	bool bypass = false;
 
-	trace_android_vh_free_one_page_bypass(page, zone, order,
-		migratetype, (int)fpi_flags, &bypass);
+	if (!pool_return)
+		trace_android_vh_free_one_page_bypass(page, zone, order,
+			migratetype, (int)fpi_flags, &bypass);
 
 	if (bypass)
 		return;
@@ -1222,6 +1229,13 @@ done_merging:
 	/* Notify page reporting subsystem of freed page */
 	if (!(fpi_flags & FPI_SKIP_REPORT_NOTIFY))
 		page_reporting_notify_free(order);
+}
+
+static inline void __free_one_page(struct page *page, unsigned long pfn,
+				   struct zone *zone, unsigned int order,
+				   int migratetype, fpi_t fpi_flags)
+{
+	__free_one_page_core(page, pfn, zone, order, migratetype, fpi_flags, false);
 }
 
 /**
@@ -2632,15 +2646,15 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
  * the smallest available page from the freelists
  */
 static __always_inline
-struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
-						int migratetype)
+struct page *__rmqueue_smallest_limit(struct zone *zone, unsigned int order,
+				      int migratetype, unsigned int order_limit)
 {
 	unsigned int current_order;
 	struct free_area *area;
 	struct page *page;
 
 	/* Find a page of the appropriate size in the preferred list */
-	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
+	for (current_order = order; current_order < order_limit; ++current_order) {
 		area = &(zone->free_area[current_order]);
 		page = get_page_from_free_area(area, migratetype);
 		if (!page)
@@ -2657,6 +2671,13 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 	return NULL;
 }
 
+
+static __always_inline
+struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+				int migratetype)
+{
+	return __rmqueue_smallest_limit(zone, order, migratetype, MAX_ORDER);
+}
 
 /*
  * This array describes the order lists are fallen back to when
@@ -3656,10 +3677,15 @@ void free_unref_page(struct page *page, unsigned int order)
 	pcp_trylock_finish(UP_flags);
 }
 
+#ifdef CONFIG_FG_PAGE_POOL
+static unsigned int fg_pool_accept_kswapd_pages(struct list_head *pages);
+#endif
+
 /*
  * Free a list of 0-order pages
  */
-void free_unref_page_list(struct list_head *list)
+static unsigned int
+__free_unref_page_list(struct list_head *list, bool kswapd)
 {
 	unsigned long __maybe_unused UP_flags;
 	struct page *page, *next;
@@ -3667,6 +3693,7 @@ void free_unref_page_list(struct list_head *list)
 	struct zone *locked_zone = NULL;
 	int batch_count = 0;
 	int migratetype;
+	unsigned int diverted = 0;
 
 	/* Prepare pages for freeing */
 	list_for_each_entry_safe(page, next, list, lru) {
@@ -3687,6 +3714,11 @@ void free_unref_page_list(struct list_head *list)
 			continue;
 		}
 	}
+
+#ifdef CONFIG_FG_PAGE_POOL
+	if (kswapd)
+		diverted = fg_pool_accept_kswapd_pages(list);
+#endif
 
 	list_for_each_entry_safe(page, next, list, lru) {
 		struct zone *zone = page_zone(page);
@@ -3746,7 +3778,20 @@ void free_unref_page_list(struct list_head *list)
 		pcp_spin_unlock(pcp);
 		pcp_trylock_finish(UP_flags);
 	}
+
+	return diverted;
 }
+
+void free_unref_page_list(struct list_head *list)
+{
+	__free_unref_page_list(list, false);
+}
+#ifdef CONFIG_FG_PAGE_POOL
+unsigned int fg_pool_free_kswapd_pages(struct list_head *pages)
+{
+	return __free_unref_page_list(pages, true);
+}
+#endif
 
 /*
  * split_page takes a non-compound higher-order page, and splits it into
@@ -4351,6 +4396,12 @@ static inline unsigned int gfp_to_alloc_flags_cma(gfp_t gfp_mask,
 	return alloc_flags;
 }
 
+#ifdef CONFIG_FG_PAGE_POOL
+static struct page *fg_pool_try_alloc(gfp_t gfp, unsigned int order,
+				      unsigned int alloc_flags,
+				      const struct alloc_context *ac);
+#endif
+
 /*
  * get_page_from_freelist goes through the zonelist trying to allocate
  * a page.
@@ -4504,6 +4555,11 @@ try_this_zone:
 		goto retry;
 	}
 
+#ifdef CONFIG_FG_PAGE_POOL
+	/* Give the ordinary allocator every allowed zone before using the pool. */
+	if (unlikely(fg_pool_active()))
+		return fg_pool_try_alloc(gfp_mask, order, alloc_flags, ac);
+#endif
 	return NULL;
 }
 
@@ -4571,6 +4627,10 @@ __alloc_pages_cpuset_fallback(gfp_t gfp_mask, unsigned int order,
 	return page;
 }
 
+#ifdef CONFIG_FG_PAGE_POOL
+static bool fg_pool_release_before_oom(gfp_t gfp, const struct alloc_context *ac);
+#endif
+
 static inline struct page *
 __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	const struct alloc_context *ac, unsigned long *did_some_progress)
@@ -4582,6 +4642,7 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 		.gfp_mask = gfp_mask,
 		.order = order,
 	};
+	gfp_t retry_gfp = (gfp_mask | __GFP_HARDWALL) & ~__GFP_DIRECT_RECLAIM;
 	struct page *page;
 
 	*did_some_progress = 0;
@@ -4604,9 +4665,8 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 * attempt shall not depend on __GFP_DIRECT_RECLAIM && !__GFP_NORETRY
 	 * allocation which will never fail due to oom_lock already held.
 	 */
-	page = get_page_from_freelist((gfp_mask | __GFP_HARDWALL) &
-				      ~__GFP_DIRECT_RECLAIM, order,
-				      ALLOC_WMARK_HIGH|ALLOC_CPUSET, ac);
+	page = get_page_from_freelist(retry_gfp, order,
+				      ALLOC_WMARK_HIGH | ALLOC_CPUSET, ac);
 	if (page)
 		goto out;
 
@@ -4640,6 +4700,16 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 * out_of_memory). Once filesystems are ready to handle allocation
 	 * failures more gracefully we should just bail out here.
 	 */
+
+#ifdef CONFIG_FG_PAGE_POOL
+	/* Let the ordinary allocator use the reserve before a global OOM. */
+	if (fg_pool_release_before_oom(retry_gfp, ac)) {
+		page = get_page_from_freelist(retry_gfp, order,
+					      ALLOC_WMARK_MIN | ALLOC_CPUSET, ac);
+		if (page)
+			goto out;
+	}
+#endif
 
 	/* Exhausted what can be done so it's blame time */
 	if (out_of_memory(&oc) ||
@@ -5216,6 +5286,603 @@ check_retry_cpuset(int cpuset_mems_cookie, struct alloc_context *ac)
 
 	return false;
 }
+
+#ifdef CONFIG_FG_PAGE_POOL
+#define FG_POOL_MAX_SPLIT_ORDER 4
+#define FG_POOL_REFILL_MARGIN 64
+#define FG_POOL_TRANSFER_BATCH 16
+#define FG_POOL_MAX_SHRINK_RESERVE 512
+
+/*
+ * Pool inventory uses its own lock. Never acquire zone->lock while holding
+ * fg_pool_lock. Transfers use private lists and RCU protects their lifetime
+ * across disable and pageblock isolation.
+ */
+static DEFINE_SPINLOCK(fg_pool_lock);
+static struct {
+	struct zone *zone;
+	struct list_head pages;
+	struct fg_pool_status status;
+	unsigned long refill_after;
+	bool startup;
+	u64 kswapd_refilled;
+	u64 epoch;
+	unsigned int pending;
+} fg_pool = {
+	.pages = LIST_HEAD_INIT(fg_pool.pages),
+	.status.config.version = FG_POOL_ABI_VERSION,
+};
+
+struct fg_pool_fast_stats {
+	u64 attempts, denied, empty, constrained, hit, bad_pages;
+};
+static DEFINE_PER_CPU(struct fg_pool_fast_stats, fg_pool_fast_stats);
+
+#define fg_pool_count_event(event) this_cpu_inc(fg_pool_fast_stats.event)
+
+bool fg_pool_active(void)
+{
+	return READ_ONCE(fg_pool.status.config.mode) != FG_POOL_OFF;
+}
+
+void fg_pool_enable(struct zone *zone, const struct fg_pool_config *cfg)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	VM_BUG_ON(fg_pool.pending || fg_pool.status.pages);
+	fg_pool.status.config = *cfg;
+	fg_pool.refill_after = jiffies;
+	fg_pool.startup = cfg->startup_pages != 0;
+	fg_pool.epoch++;
+	WRITE_ONCE(fg_pool.zone, zone);
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+}
+
+static unsigned int fg_pool_target(void)
+{
+	lockdep_assert_held(&fg_pool_lock);
+	return fg_pool.startup ? fg_pool.status.config.startup_pages :
+		fg_pool.status.config.target_pages;
+}
+
+static unsigned int fg_pool_deficit(void)
+{
+	return fg_pool_target() - fg_pool.status.pages - fg_pool.pending;
+}
+
+int fg_pool_start_steady(void)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	if (!fg_pool_active())
+		ret = -EINVAL;
+	else if (fg_pool.startup) {
+		if (fg_pool.status.pages < fg_pool_target())
+			ret = -EAGAIN;
+		else
+			fg_pool.startup = false;
+	}
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	return ret;
+}
+
+static struct page *fg_pool_pop(void)
+{
+	struct page *page = list_first_entry(&fg_pool.pages, struct page, lru);
+
+	list_del(&page->lru);
+	fg_pool.status.pages--;
+	return page;
+}
+
+/* Caller owns the pages exclusively. No pool lock is held while merging. */
+static unsigned long fg_pool_return_list(struct zone *zone,
+					 struct list_head *pages)
+{
+	unsigned long flags, returned = 0;
+
+	while (!list_empty(pages)) {
+		unsigned int batch = FG_POOL_TRANSFER_BATCH;
+
+		spin_lock_irqsave(&zone->lock, flags);
+		while (batch-- && !list_empty(pages)) {
+			struct page *page = list_first_entry(pages, struct page, lru);
+
+			list_del(&page->lru);
+			if (unlikely(check_new_pages(page, 0))) {
+				fg_pool_count_event(bad_pages);
+				continue;
+			}
+			__free_one_page_core(page, page_to_pfn(page), zone, 0,
+					    get_pageblock_migratetype(page),
+					    FPI_TO_TAIL, true);
+			returned++;
+		}
+		spin_unlock_irqrestore(&zone->lock, flags);
+	}
+	return returned;
+}
+
+static void fg_pool_record_return(unsigned long returned,
+				 enum fg_pool_return_reason why)
+{
+	switch (why) {
+	case FG_POOL_SHRINK:
+		fg_pool.status.shrink_returned += returned;
+		break;
+	case FG_POOL_OOM:
+		fg_pool.status.oom_returned += returned;
+		break;
+	case FG_POOL_DRAIN:
+		fg_pool.status.drained += returned;
+		break;
+	case FG_POOL_ISOLATION:
+		fg_pool.status.isolation_returned += returned;
+		break;
+	}
+}
+
+static unsigned long fg_pool_shrinkable_locked(struct zone *zone)
+{
+	unsigned int reserve;
+
+	lockdep_assert_held(&fg_pool_lock);
+	if (!zone || !fg_pool_active() || !fg_pool.status.pages)
+		return 0;
+
+	reserve = clamp_t(unsigned int, fg_pool_target() / 4, 1,
+			  FG_POOL_MAX_SHRINK_RESERVE);
+	if (!zone_watermark_ok(zone, 0, min_wmark_pages(zone),
+			       MAX_NR_ZONES - 1, 0))
+		return fg_pool.status.pages;
+	if (!zone_watermark_ok(zone, 0, low_wmark_pages(zone),
+			       MAX_NR_ZONES - 1, 0))
+		reserve /= 2;
+
+	return fg_pool.status.pages - min(fg_pool.status.pages, reserve);
+}
+
+/* The caller holds RCU, or has disabled the pool and waited for readers. */
+static unsigned long fg_pool_release_zone(struct zone *zone, unsigned long nr,
+					  enum fg_pool_return_reason why)
+{
+	LIST_HEAD(pages);
+	unsigned long flags, returned = 0;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	if (!zone || fg_pool.zone != zone ||
+	    (!fg_pool_active() && why != FG_POOL_DRAIN))
+		goto unlock;
+
+	if (why == FG_POOL_OOM) {
+		list_splice_init(&fg_pool.pages, &pages);
+		fg_pool.status.pages = 0;
+	} else {
+		if (why == FG_POOL_SHRINK)
+			nr = min(nr, fg_pool_shrinkable_locked(zone));
+		nr = min_t(unsigned long, nr, FG_POOL_MAX_BATCH);
+		while (nr-- && fg_pool.status.pages)
+			list_add_tail(&fg_pool_pop()->lru, &pages);
+	}
+
+	if (why != FG_POOL_DRAIN &&
+	    (!list_empty(&pages) || (why == FG_POOL_OOM && fg_pool.pending))) {
+		fg_pool.refill_after = jiffies +
+			msecs_to_jiffies(fg_pool.status.config.cooldown_ms);
+		/* A refill already in flight must return its private pages. */
+		fg_pool.epoch++;
+	}
+unlock:
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	if (list_empty(&pages))
+		return 0;
+
+	returned = fg_pool_return_list(zone, &pages);
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	fg_pool_record_return(returned, why);
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	return returned;
+}
+
+unsigned long fg_pool_release(unsigned long nr, enum fg_pool_return_reason why)
+{
+	unsigned long returned;
+
+	rcu_read_lock();
+	returned = fg_pool_release_zone(READ_ONCE(fg_pool.zone), nr, why);
+	rcu_read_unlock();
+	return returned;
+}
+
+void fg_pool_disable(void)
+{
+	struct zone *zone;
+	unsigned long flags;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	zone = fg_pool.zone;
+	WRITE_ONCE(fg_pool.status.config.mode, FG_POOL_OFF);
+	fg_pool.epoch++;
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	if (!zone)
+		return;
+
+	/* Includes detached returns, refills, and page preparation on hits. */
+	synchronize_rcu();
+	while (READ_ONCE(fg_pool.status.pages)) {
+		fg_pool_release_zone(zone, FG_POOL_MAX_BATCH, FG_POOL_DRAIN);
+		cond_resched();
+	}
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	VM_BUG_ON(fg_pool.pending);
+	fg_pool.status.config.target_pages = 0;
+	WRITE_ONCE(fg_pool.zone, NULL);
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+}
+
+#ifdef CONFIG_MEMORY_ISOLATION
+void fg_pool_drain_isolated(void)
+{
+	struct zone *zone;
+	unsigned long flags;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	zone = fg_pool.zone;
+	if (!zone || !has_isolate_pageblock(zone)) {
+		spin_unlock_irqrestore(&fg_pool_lock, flags);
+		return;
+	}
+	fg_pool.epoch++;
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+
+	/*
+	 * Pageblocks were marked before this callback. New refills reject the
+	 * zone; finish any older transfers before the caller tests isolation.
+	 */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (;;) {
+		bool remaining;
+
+		spin_lock_irqsave(&fg_pool_lock, flags);
+		remaining = fg_pool.zone == zone && fg_pool_active() &&
+			    fg_pool.status.pages;
+		spin_unlock_irqrestore(&fg_pool_lock, flags);
+		if (!remaining)
+			break;
+		fg_pool_release_zone(zone, FG_POOL_MAX_BATCH, FG_POOL_ISOLATION);
+	}
+	rcu_read_unlock();
+}
+#endif
+
+unsigned long fg_pool_shrinkable(void)
+{
+	unsigned long flags, nr;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	nr = fg_pool_shrinkable_locked(fg_pool.zone);
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	return nr;
+}
+
+void fg_pool_snapshot(struct fg_pool_status *status)
+{
+	struct zone *zone;
+	unsigned long flags;
+	int cpu;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	zone = fg_pool.zone;
+	*status = fg_pool.status;
+	status->high_watermark = zone ? high_wmark_pages(zone) : 0;
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	for_each_possible_cpu(cpu) {
+		const struct fg_pool_fast_stats *s = &per_cpu(fg_pool_fast_stats, cpu);
+
+		status->attempts += READ_ONCE(s->attempts);
+		status->denied += READ_ONCE(s->denied);
+		status->empty += READ_ONCE(s->empty);
+		status->constrained += READ_ONCE(s->constrained);
+		status->hit += READ_ONCE(s->hit);
+		status->bad_pages += READ_ONCE(s->bad_pages);
+	}
+}
+
+void fg_pool_refill_snapshot(struct fg_pool_refill_stats *stats)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	stats->kswapd = fg_pool.kswapd_refilled;
+	stats->buddy = fg_pool.status.refilled - stats->kswapd;
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+}
+
+/*
+ * Accept only pages already prepared for release by kswapd. The batch size
+ * bounds work under the pool lock, not the number moved from this list.
+ */
+static unsigned int fg_pool_accept_kswapd_pages(struct list_head *pages)
+{
+	struct list_head *pos = pages->next;
+	unsigned int taken = 0;
+	unsigned long flags;
+	u64 epoch;
+
+	if (list_empty(pages) || !fg_pool_active() ||
+	    !(READ_ONCE(fg_pool.status.config.flags) &
+	      (FG_POOL_CONFIG_RECLAIM_REFILL | FG_POOL_CONFIG_HYBRID_REFILL)))
+		return 0;
+
+	rcu_read_lock();
+	epoch = READ_ONCE(fg_pool.epoch);
+	while (pos != pages && spin_trylock_irqsave(&fg_pool_lock, flags)) {
+		struct zone *zone = fg_pool.zone;
+		unsigned int scanned = 0, moved = 0, deficit;
+
+		if (!zone || !fg_pool_active() || fg_pool.epoch != epoch ||
+		    !(fg_pool.status.config.flags &
+		      (FG_POOL_CONFIG_RECLAIM_REFILL | FG_POOL_CONFIG_HYBRID_REFILL)) ||
+		    fg_pool.startup || time_before(jiffies, fg_pool.refill_after) ||
+		    has_isolate_pageblock(zone))
+			goto unlock;
+		deficit = fg_pool_deficit();
+		if (!deficit)
+			goto unlock;
+		/* Diverting pages leaves current ordinary free memory unchanged. */
+		if (!zone_watermark_ok(zone, 0,
+				       low_wmark_pages(zone) + FG_POOL_REFILL_MARGIN,
+				       MAX_NR_ZONES - 1, 0)) {
+			fg_pool.status.watermark_stops++;
+			goto unlock;
+		}
+
+		while (pos != pages && scanned++ < FG_POOL_TRANSFER_BATCH &&
+		       moved < deficit) {
+			struct page *page = list_entry(pos, struct page, lru);
+
+			pos = pos->next;
+			if (page_zone(page) != zone ||
+			    get_pcppage_migratetype(page) != MIGRATE_MOVABLE ||
+			    get_pageblock_migratetype(page) != MIGRATE_MOVABLE)
+				continue;
+			list_move_tail(&page->lru, &fg_pool.pages);
+			moved++;
+		}
+		fg_pool.status.pages += moved;
+		fg_pool.status.refilled += moved;
+		fg_pool.kswapd_refilled += moved;
+		taken += moved;
+		spin_unlock_irqrestore(&fg_pool_lock, flags);
+	}
+	goto out;
+unlock:
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+out:
+	rcu_read_unlock();
+	return taken;
+}
+
+static unsigned int fg_pool_refill_buddy_batch(unsigned int limit, u64 epoch)
+{
+	LIST_HEAD(pages);
+	struct zone *zone;
+	unsigned long flags, mark;
+	unsigned int reserved, remaining, taken = 0, added = 0;
+	bool stopped = false;
+
+	rcu_read_lock();
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	zone = fg_pool.zone;
+	if (!zone || !fg_pool_active() || fg_pool.epoch != epoch ||
+	    (fg_pool.status.config.flags & FG_POOL_CONFIG_RECLAIM_REFILL) ||
+	    time_before(jiffies, fg_pool.refill_after)) {
+		spin_unlock_irqrestore(&fg_pool_lock, flags);
+		goto out;
+	}
+	reserved = min(limit, fg_pool_deficit());
+	fg_pool.pending += reserved;
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	if (!reserved)
+		goto out;
+
+	/* Best-effort maintenance yields to a busy ordinary allocator. */
+	if (!spin_trylock_irqsave(&zone->lock, flags))
+		goto publish;
+	if (has_isolate_pageblock(zone))
+		goto unlock_zone;
+	mark = high_wmark_pages(zone) + FG_POOL_REFILL_MARGIN;
+	remaining = reserved;
+	while (remaining--) {
+		struct page *page;
+
+		if (!zone_watermark_ok_safe(zone, 0, mark, MAX_NR_ZONES - 1)) {
+			stopped = true;
+			break;
+		}
+		page = __rmqueue_smallest_limit(zone, 0, MIGRATE_MOVABLE,
+					      FG_POOL_MAX_SPLIT_ORDER + 1);
+		if (!page)
+			break;
+		__mod_zone_freepage_state(zone, -1, MIGRATE_MOVABLE);
+		taken++;
+		if (unlikely(check_new_pages(page, 0))) {
+			fg_pool_count_event(bad_pages);
+			continue;
+		}
+		list_add_tail(&page->lru, &pages);
+		added++;
+	}
+unlock_zone:
+	spin_unlock_irqrestore(&zone->lock, flags);
+publish:
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	fg_pool.pending -= reserved;
+	fg_pool.status.refilled += taken;
+	fg_pool.status.watermark_stops += stopped;
+	if (fg_pool.zone == zone && fg_pool_active() &&
+	    fg_pool.epoch == epoch && !has_isolate_pageblock(zone)) {
+		list_splice_tail_init(&pages, &fg_pool.pages);
+		fg_pool.status.pages += added;
+	}
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	if (!list_empty(&pages)) {
+		unsigned long returned = fg_pool_return_list(zone, &pages);
+
+		spin_lock_irqsave(&fg_pool_lock, flags);
+		fg_pool.status.stale_returned += returned;
+		spin_unlock_irqrestore(&fg_pool_lock, flags);
+		added = 0;
+	}
+out:
+	rcu_read_unlock();
+	return added;
+}
+
+void fg_pool_refill(void)
+{
+	unsigned long flags;
+	unsigned int remaining;
+	u64 epoch;
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	remaining = fg_pool_active() ? fg_pool_deficit() : 0;
+	epoch = fg_pool.epoch;
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+
+	/* Fill the original deficit without monopolizing the zone lock. */
+	while (remaining) {
+		unsigned int chunk = min_t(unsigned int, remaining, FG_POOL_TRANSFER_BATCH);
+
+		if (fg_pool_refill_buddy_batch(chunk, epoch) != chunk)
+			break;
+		remaining -= chunk;
+		cond_resched();
+	}
+}
+
+static bool fg_pool_zone_allowed(struct zone *target, gfp_t gfp,
+				 unsigned int alloc_flags,
+				 const struct alloc_context *ac)
+{
+	struct zoneref *z = ac->preferred_zoneref;
+	struct zone *zone;
+
+	for_next_zone_zonelist_nodemask(zone, z, ac->highest_zoneidx,
+					 ac->nodemask) {
+		if (zone != target)
+			continue;
+		return !cpusets_enabled() || !(alloc_flags & ALLOC_CPUSET) ||
+			__cpuset_zone_allowed(zone, gfp);
+	}
+	return false;
+}
+
+static struct page *fg_pool_try_alloc(gfp_t gfp, unsigned int order,
+				      unsigned int alloc_flags,
+				      const struct alloc_context *ac)
+{
+	struct zone *zone;
+	struct page *page = NULL;
+	unsigned long flags;
+	unsigned int mode;
+	u64 epoch;
+
+	if (order || !in_task() || !current->mm || current->reclaim_state ||
+	    (current->flags & (PF_MEMALLOC | PF_KTHREAD)))
+		return NULL;
+	if (ac->migratetype != MIGRATE_MOVABLE ||
+	    !(gfp & __GFP_DIRECT_RECLAIM) ||
+	    (gfp & (__GFP_MEMALLOC | __GFP_ATOMIC | __GFP_ACCOUNT)) ||
+	    (alloc_flags & (ALLOC_NO_WATERMARKS | ALLOC_OOM |
+			    ALLOC_NON_BLOCK | ALLOC_MIN_RESERVE)))
+		return NULL;
+
+	rcu_read_lock();
+	epoch = READ_ONCE(fg_pool.epoch);
+	zone = READ_ONCE(fg_pool.zone);
+	mode = READ_ONCE(fg_pool.status.config.mode);
+	if (!zone || mode == FG_POOL_OFF)
+		goto out;
+	fg_pool_count_event(attempts);
+	if (!fg_pool_zone_allowed(zone, gfp, alloc_flags, ac) ||
+	    (ac->spread_dirty_pages && !node_dirty_ok(zone->zone_pgdat))) {
+		fg_pool_count_event(constrained);
+		goto out;
+	}
+	if (mode != FG_POOL_SHARED && !fg_pool_current_eligible()) {
+		fg_pool_count_event(denied);
+		goto out;
+	}
+	if (!READ_ONCE(fg_pool.status.pages)) {
+		fg_pool_count_event(empty);
+		goto out;
+	}
+
+	spin_lock_irqsave(&fg_pool_lock, flags);
+	if (fg_pool.zone != zone || fg_pool.epoch != epoch ||
+	    fg_pool.status.config.mode != mode || !fg_pool_active())
+		goto unlock;
+	if (!fg_pool.status.pages) {
+		fg_pool_count_event(empty);
+		goto unlock;
+	}
+	page = fg_pool_pop();
+unlock:
+	spin_unlock_irqrestore(&fg_pool_lock, flags);
+	if (!page)
+		goto out;
+
+	/* No buddy lock is needed to hand off an exclusively owned free page. */
+	if (unlikely(get_pageblock_migratetype(page) != MIGRATE_MOVABLE)) {
+		LIST_HEAD(pages);
+		unsigned long returned;
+
+		list_add(&page->lru, &pages);
+		returned = fg_pool_return_list(zone, &pages);
+		spin_lock_irqsave(&fg_pool_lock, flags);
+		fg_pool.status.stale_returned += returned;
+		spin_unlock_irqrestore(&fg_pool_lock, flags);
+		page = NULL;
+		goto out;
+	}
+	if (unlikely(check_new_pages(page, 0))) {
+		fg_pool_count_event(bad_pages);
+		page = NULL;
+		goto out;
+	}
+	prep_new_page(page, 0, gfp, alloc_flags);
+	fg_pool_count_event(hit);
+	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1);
+	zone_statistics(ac->preferred_zoneref->zone, zone, 1);
+	trace_fg_pool_hit(task_tgid_nr(current), zone_to_nid(zone),
+			  page_to_pfn(page), mode);
+out:
+	rcu_read_unlock();
+	return page;
+}
+
+static bool fg_pool_release_before_oom(gfp_t gfp, const struct alloc_context *ac)
+{
+	struct zone *zone;
+	bool released = false;
+
+	if (!fg_pool_active())
+		return false;
+
+	rcu_read_lock();
+	zone = READ_ONCE(fg_pool.zone);
+	if (zone && fg_pool_zone_allowed(zone, gfp, ALLOC_CPUSET, ac))
+		released = fg_pool_release_zone(zone, ULONG_MAX, FG_POOL_OOM);
+	rcu_read_unlock();
+	return released;
+}
+#endif /* CONFIG_FG_PAGE_POOL */
+
 
 static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,

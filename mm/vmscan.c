@@ -64,6 +64,9 @@
 #include <linux/balloon_compaction.h>
 #include <linux/sched/sysctl.h>
 
+#ifdef CONFIG_FG_PAGE_POOL
+#include "fg_page_pool.h"
+#endif
 #include "internal.h"
 #include "swap.h"
 
@@ -2143,7 +2146,13 @@ keep:
 
 	mem_cgroup_uncharge_list(&free_folios);
 	try_to_unmap_flush();
-	free_unref_page_list(&free_folios);
+#ifdef CONFIG_FG_PAGE_POOL
+	if (current_is_kswapd()) {
+		/* Reserved pages do not make progress toward ordinary free memory. */
+		nr_reclaimed -= fg_pool_free_kswapd_pages(&free_folios);
+	} else
+#endif
+		free_unref_page_list(&free_folios);
 
 	list_splice(&ret_folios, folio_list);
 	count_vm_events(PGACTIVATE, pgactivate);

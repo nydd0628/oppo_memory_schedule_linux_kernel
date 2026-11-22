@@ -2,6 +2,20 @@
 
 menu "Memory Management options"
 
+config FG_PAGE_POOL
+	bool "Experimental foreground page allocation reserve"
+	depends on MMU && (ARM64 || X86_64) && !MEMORY_HOTREMOVE
+	help
+	  Provide a bounded order-0 page reserve after the ordinary page
+	  allocator cannot satisfy a request. A privileged controller can
+	  restrict access to selected processes. The reserve is inactive at boot.
+
+	  Enable this for experiments using the /dev/fg_page_pool controller.
+	  The reserve holds unallocated pages in one normal zone and is not
+	  available on builds that support memory hot removal.
+
+	  If unsure, say N.
+
 #
 # For some reason microblaze and nios2 hard code SWAP=n.  Hopefully we can
 # add proper SWAP support to them, in which case this can be remove.
