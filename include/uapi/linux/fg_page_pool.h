@@ -10,7 +10,7 @@
 
 enum fg_pool_mode {
 	FG_POOL_OFF,
-	FG_POOL_SHARED,
+	FG_POOL_SHARED, /* Reserved former unrestricted mode. */
 	FG_POOL_FOREGROUND,
 	FG_POOL_FOREGROUND_FAST,
 };
@@ -34,6 +34,7 @@ struct fg_pool_config {
 	__u32 reserved[2];
 };
 
+/* Legacy pidfd request. New kernels reject this ioctl. */
 struct fg_pool_members {
 	__u32 version;
 	__u32 count;
@@ -41,6 +42,16 @@ struct fg_pool_members {
 	__u32 lease_ms;
 	__u32 reserved;
 	__s32 pidfds[FG_POOL_MAX_MEMBERS];
+};
+
+struct fg_pool_uid_members {
+	__u32 version;
+	__u32 count;
+	__aligned_u64 generation;
+	__u32 lease_ms;
+	__u32 reserved;
+	/* Android UIDs in the initial user namespace. */
+	__u32 uids[FG_POOL_MAX_MEMBERS];
 };
 
 struct fg_pool_status {
@@ -55,9 +66,9 @@ struct fg_pool_status {
 	__aligned_u64 denied;
 	__aligned_u64 constrained;
 	__aligned_u64 watermark_stops;
-	__aligned_u64 shrink_returned;
+	__aligned_u64 shrink_returned; /* Reserved, always zero. */
 	__aligned_u64 oom_returned;
-	__aligned_u64 drained;
+	__aligned_u64 drained; /* Explicit disable or target reduction. */
 	__aligned_u64 isolation_returned;
 	__aligned_u64 stale_returned;
 	__aligned_u64 bad_pages;
@@ -75,5 +86,8 @@ struct fg_pool_refill_stats {
 #define FG_POOL_GET_REFILL_STATS	_IOR(0xf6, 4, struct fg_pool_refill_stats)
 /* Returns EAGAIN until the startup target is stocked. */
 #define FG_POOL_START_STEADY	_IO(0xf6, 5)
+#define FG_POOL_REPLACE_UIDS	_IOW(0xf6, 6, struct fg_pool_uid_members)
+/* Takes a page count, including zero. The UID list is retained. */
+#define FG_POOL_SET_TARGET	_IOW(0xf6, 7, __u32)
 
 #endif

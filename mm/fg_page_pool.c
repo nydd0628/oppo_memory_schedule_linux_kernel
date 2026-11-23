@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/capability.h>
 #include <linux/compat.h>
+#include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
-#include <linux/pid.h>
 #include <linux/rcupdate.h>
-#include <linux/sched/mm.h>
-#include <linux/sched/task.h>
-#include <linux/shrinker.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/user_namespace.h>
 #include <linux/workqueue.h>
 
 #include "fg_page_pool.h"
@@ -26,15 +24,10 @@
 #define FG_POOL_MAX_BYTES SZ_32M
 #define FG_POOL_MAX_LEASE_MS 60000
 
-struct fg_pool_member {
-	struct pid *tgid;
-	struct mm_struct *mm;
-};
-
 struct fg_pool_registry {
 	unsigned long expires;
 	unsigned int count;
-	struct fg_pool_member members[];
+	kuid_t members[];
 };
 
 static DEFINE_MUTEX(fg_pool_control_lock);
@@ -45,32 +38,17 @@ static u32 fg_pool_interval_ms;
 bool fg_pool_current_eligible(void)
 {
 	struct fg_pool_registry *reg = rcu_dereference(fg_pool_registry);
+	kuid_t uid = current_uid();
 	unsigned int i;
 
 	if (!reg || time_after_eq(jiffies, reg->expires))
 		return false;
 
-	for (i = 0; i < reg->count; i++) {
-		if (reg->members[i].tgid == task_tgid(current) &&
-		    reg->members[i].mm == current->mm)
+	for (i = 0; i < reg->count; i++)
+		if (uid_eq(reg->members[i], uid))
 			return true;
-	}
 
 	return false;
-}
-
-static void fg_pool_free_registry(struct fg_pool_registry *reg)
-{
-	unsigned int i;
-
-	if (!reg)
-		return;
-
-	for (i = 0; i < reg->count; i++) {
-		put_pid(reg->members[i].tgid);
-		mmdrop(reg->members[i].mm);
-	}
-	kfree(reg);
 }
 
 static void fg_pool_publish(struct fg_pool_registry *reg)
@@ -81,15 +59,14 @@ static void fg_pool_publish(struct fg_pool_registry *reg)
 				  lockdep_is_held(&fg_pool_control_lock));
 	if (old) {
 		synchronize_rcu();
-		fg_pool_free_registry(old);
+		kfree(old);
 	}
 }
 
-static int fg_pool_replace_members(const struct fg_pool_members *req)
+static int fg_pool_replace_uids(const struct fg_pool_uid_members *req)
 {
 	struct fg_pool_registry *reg;
-	unsigned int i, j, flags;
-	int ret;
+	unsigned int i, j;
 
 	if (req->version != FG_POOL_ABI_VERSION || req->reserved ||
 	    req->count > FG_POOL_MAX_MEMBERS ||
@@ -111,54 +88,25 @@ static int fg_pool_replace_members(const struct fg_pool_members *req)
 		return -ENOMEM;
 
 	for (i = 0; i < req->count; i++) {
-		struct task_struct *task;
-		struct mm_struct *mm;
-		struct pid *tgid;
+		kuid_t uid = make_kuid(&init_user_ns, req->uids[i]);
 
-		if (req->pidfds[i] < 0) {
-			ret = -EBADF;
+		if (!uid_valid(uid))
 			goto fail;
-		}
-
-		tgid = pidfd_get_pid(req->pidfds[i], &flags);
-		if (IS_ERR(tgid)) {
-			ret = PTR_ERR(tgid);
-			goto fail;
-		}
-
-		for (j = 0; j < i; j++) {
-			if (reg->members[j].tgid == tgid) {
-				put_pid(tgid);
-				ret = -EINVAL;
+		for (j = 0; j < i; j++)
+			if (uid_eq(reg->members[j], uid))
 				goto fail;
-			}
-		}
-
-		task = get_pid_task(tgid, PIDTYPE_TGID);
-		mm = task ? get_task_mm(task) : NULL;
-		if (task)
-			put_task_struct(task);
-		if (!mm) {
-			put_pid(tgid);
-			ret = -ESRCH;
-			goto fail;
-		}
-
-		mmgrab(mm);
-		mmput(mm);
-		reg->members[i].tgid = tgid;
-		reg->members[i].mm = mm;
-		reg->count++;
+		reg->members[i] = uid;
 	}
 
+	reg->count = req->count;
 	reg->expires = jiffies + msecs_to_jiffies(req->lease_ms);
 	fg_pool_publish(reg);
 	fg_pool_generation = req->generation;
 	return 0;
 
 fail:
-	fg_pool_free_registry(reg);
-	return ret;
+	kfree(reg);
+	return -EINVAL;
 }
 
 static void fg_pool_workfn(struct work_struct *work);
@@ -188,7 +136,7 @@ static int fg_pool_set_config(const struct fg_pool_config *cfg)
 
 	if (cfg->version != FG_POOL_ABI_VERSION ||
 	    memchr_inv(cfg->reserved, 0, sizeof(cfg->reserved)) ||
-	    cfg->mode < FG_POOL_SHARED || cfg->mode > FG_POOL_FOREGROUND_FAST ||
+	    cfg->mode < FG_POOL_FOREGROUND || cfg->mode > FG_POOL_FOREGROUND_FAST ||
 	    (cfg->flags & ~(FG_POOL_CONFIG_ELASTIC |
 			    FG_POOL_CONFIG_RECLAIM_REFILL |
 			    FG_POOL_CONFIG_HYBRID_REFILL)) ||
@@ -241,11 +189,27 @@ static long fg_pool_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 			fg_pool_set_config(&cfg);
 		break;
 	}
-	case FG_POOL_REPLACE_MEMBERS: {
-		struct fg_pool_members req;
+	case FG_POOL_REPLACE_UIDS: {
+		struct fg_pool_uid_members req;
 
 		ret = copy_from_user(&req, up, sizeof(req)) ? -EFAULT :
-			fg_pool_replace_members(&req);
+			fg_pool_replace_uids(&req);
+		break;
+	}
+	case FG_POOL_SET_TARGET: {
+		u32 target;
+
+		if (copy_from_user(&target, up, sizeof(target))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (target > FG_POOL_MAX_BYTES / PAGE_SIZE) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = fg_pool_set_target(target);
+		if (!ret && target && READ_ONCE(fg_pool_interval_ms))
+			mod_delayed_work(system_wq, &fg_pool_work, 0);
 		break;
 	}
 	case FG_POOL_GET_STATUS: {
@@ -282,28 +246,6 @@ static long fg_pool_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 	return ret;
 }
 
-static unsigned long fg_pool_shrink_count(struct shrinker *shrinker,
-					  struct shrink_control *sc)
-{
-	return fg_pool_shrinkable();
-}
-
-static unsigned long fg_pool_shrink_scan(struct shrinker *shrinker,
-					 struct shrink_control *sc)
-{
-	unsigned long nr = fg_pool_release(sc->nr_to_scan, FG_POOL_SHRINK);
-
-	sc->nr_scanned = nr;
-	return nr ?: SHRINK_STOP;
-}
-
-static struct shrinker fg_pool_shrinker = {
-	.count_objects = fg_pool_shrink_count,
-	.scan_objects = fg_pool_shrink_scan,
-	.batch = FG_POOL_MAX_BATCH,
-	.seeks = DEFAULT_SEEKS,
-};
-
 static const struct file_operations fg_pool_fops = {
 	.unlocked_ioctl = fg_pool_ioctl,
 #ifdef CONFIG_COMPAT
@@ -321,16 +263,6 @@ static struct miscdevice fg_pool_device = {
 
 static int __init fg_pool_init(void)
 {
-	int ret;
-
-	ret = register_shrinker(&fg_pool_shrinker, "fg_page_pool");
-	if (ret)
-		return ret;
-
-	ret = misc_register(&fg_pool_device);
-	if (ret)
-		unregister_shrinker(&fg_pool_shrinker);
-
-	return ret;
+	return misc_register(&fg_pool_device);
 }
 late_initcall(fg_pool_init);
