@@ -69,6 +69,7 @@ stop()
 	expect 'state=OFF '
 	expect 'F=0 G=0 R=0 retiring=0 .* balanced=1'
 	expect 'queue top=0 fgs=0 live=0'
+	expect 'permits_pending=0'
 }
 
 # mode domain weights pool settings queue settings trace run_id role_tgids
@@ -131,12 +132,15 @@ setup 1 0 0 0 4 4 2 2 2 1000 3 0 0 0
 submit 0 force 13
 await_line "$tmp/out0" '^13=0$'
 expect 'role=0 .* pool_ok=1'
+submit 1 auto 14
+await_line "$tmp/out1" '^14=0$'
+expect 'role=1 .* claimed=0 .*fast_ok=1 .*pool_ok=0'
 stop
 
 run=20
 setup 2 0 0 0 8 8 4 4 4 1000 3 16 1000000 1
 control test manual 1
-submit 1 force 21
+submit 1 auto 21
 await_line "$qos/status" 'queue top=0 fgs=1'
 submit 0 force 22
 await_line "$qos/status" 'queue top=1 fgs=1'
@@ -145,6 +149,7 @@ control test step
 [ "$(grants)" = 10 ] || fail 'global FIFO order'
 await_line "$tmp/out1" '^21=0$'
 await_line "$tmp/out0" '^22=0$'
+expect 'role=1 .* claimed=0 .*permitted_ok=1'
 stop
 
 for weight in 1 2 3 4; do
@@ -156,7 +161,7 @@ for weight in 1 2 3 4; do
 		submit 0 force "$((100 * weight + i))"
 		await_line "$qos/status" "queue top=$i fgs=0"
 	done
-	submit 1 force "$((100 * weight + 90))"
+	submit 1 auto "$((100 * weight + 90))"
 	await_line "$qos/status" "queue top=$nr fgs=1"
 	expected=
 	for i in $(seq 1 "$weight"); do
@@ -180,24 +185,28 @@ for i in 1 2 3 4; do
 	submit 0 force "$((500 + i))"
 	await_line "$qos/status" "queue top=$i fgs=0"
 done
-submit 1 force 590
+submit 1 auto 590
 await_line "$qos/status" 'queue top=4 fgs=1'
 control test step
 control test step
 control test step
-[ "$(grants)" = 00 ] || fail 'empty pool granted an extra page'
+[ "$(grants)" = 001 ] || fail 'empty pool did not allow a background permit'
+await_line "$tmp/out1" '^590=0$'
 await_line "$qos/status" 'paused=1 pending=0'
 expect 'cursor=2'
-control test fail_after -1
-control recover
+control test reclaim 3
 await_line "$qos/status" 'pool F=2 G=0 R=0'
+expect 'refill_sources reclaim=2 ordinary=0'
+submit 1 auto 591
+await_line "$qos/status" 'queue top=2 fgs=1'
 control test step
 control test step
-[ "$(grants)" = 0001 ] || fail 'refill reset the WRR cursor'
-await_line "$tmp/out1" '^590=0$'
+[ "$(grants)" = 00101 ] || fail 'reclaim refill reset the WRR cursor'
+await_line "$tmp/out1" '^591=0$'
 control test manual 0
 await_line "$tmp/out0" '^504=0$'
 stop
+control test fail_after -1
 
 run=50
 setup 3 0 3 1 8 8 4 4 4 1000 3 16 1000000 1
@@ -234,20 +243,50 @@ submit 0 force 701
 await_line "$tmp/out0" '^701=0$'
 expect 'expired=1'
 expect 'role=0 .* slow_ok=1'
+submit 1 auto 791
+await_line "$tmp/out1" '^791=0$'
+expect '^fgs_bypass .* expired=1 '
+expect 'role=1 .*fgs_bypass_ok=1'
 stop
 
 run=52
 setup 3 0 3 1 8 8 4 4 4 1000 3 1 1000000 1
 control test manual 1
-submit 0 force 711
-await_line "$qos/status" 'queue top=1 fgs=0'
-submit 0 force 712
-await_line "$tmp/out0" '^712=0$'
-expect 'full=1'
-expect 'role=0 .* slow_ok=1'
+submit 1 auto 711
+await_line "$qos/status" 'queue top=0 fgs=1'
+submit 1 auto 712
+await_line "$tmp/out1" '^712=0$'
+expect '^fgs_bypass .* full=1 '
+expect 'role=1 .*fgs_bypass_ok=1'
 control test step
-await_line "$tmp/out0" '^711=0$'
+await_line "$tmp/out1" '^711=0$'
+expect 'role=1 .*permitted_ok=1 .*fgs_bypass_ok=1'
+expect 'pool F=8 G=0 R=0 .* delivered=0 '
 stop
+
+run=53
+setup 3 0 3 1 8 8 4 4 4 1000 3 16 1000000 1
+control test manual 1
+control test hold 1
+submit 1 force 721
+await_line "$qos/status" 'queue top=0 fgs=1'
+control test step
+expect 'permits_pending=1 permits_used=0'
+generation=$(sed -n 's/.* state=ACTIVE session=\([0-9]*\)$/\1/p' "$qos/status")
+id=$(sed -n 's/.*run=53 .* id=\([0-9]*\) parent=721 .*phase=grant_permit .*/\1/p' "$trace/trace")
+[ -n "$generation" ] && [ -n "$id" ] || fail 'missing background permit'
+control cancel "$generation" "$id"
+await_line "$tmp/out1" '^721=125$'
+expect 'permits_pending=0 permits_used=0'
+expect '^fgs_bypass .* explicit=0 '
+submit 1 force 722
+await_line "$qos/status" 'queue top=0 fgs=1'
+control test step
+expect 'permits_pending=1 permits_used=0'
+stop
+await_line "$tmp/out1" '^722=0$'
+expect '^fgs_bypass .* stop=1 '
+expect 'role=1 .*fgs_bypass_ok=1'
 
 run=60
 setup 3 1 3 1 8 8 4 4 4 1000 3 16 250 1
@@ -256,11 +295,10 @@ submit 1 anon 891
 await_line "$tmp/out0" '^801=0$'
 await_line "$tmp/out1" '^891=0$'
 expect 'role=0 .* fast_ok=[1-9]'
-expect 'role=1 .* fast_ok=[1-9]'
+expect 'role=1 .*permitted_ok=[1-9]'
 stop
 
-# Verify each observed claim uses its own grant's page, and grant ownership
-# can change only after a revoke.
+# Verify exclusive page ownership for TOP and permit ownership for FGS.
 awk '
 	/phase=(grant|claim|revoke)/ {
 		for (i = 1; i <= NF; i++) {
@@ -268,6 +306,24 @@ awk '
 			v[kv[1]] = kv[2]
 		}
 		page = v["session"] ":" v["page"]
+		if (v["phase"] ~ /_permit$/) {
+			key = v["session"] ":" v["id"]
+			if (v["role"] != 1 || v["page"] != 0)
+				exit 1
+			if (v["phase"] == "grant_permit") {
+				if (permit[key])
+					exit 1
+				permit[key] = v["ordinal"]
+			} else {
+				if (permit[key] != v["ordinal"])
+					exit 1
+				delete permit[key]
+				permits++
+			}
+			next
+		}
+		if (v["role"] != 0 || v["page"] == 0)
+			exit 1
 		if (v["phase"] == "grant") {
 			if (owner[page] || consumed[page])
 				exit 1
@@ -284,10 +340,12 @@ awk '
 		}
 	}
 	END {
-		if (!grants || !claims)
+		if (!grants || !claims || !permits)
 			exit 1
 		for (page in owner)
 			exit 1
+		for (key in permit)
+			exit 1
 	}
 ' "$trace/trace" || fail 'trace page ownership'
-echo 'PASS: native, pool-only, FIFO, WRR, refill, expiry, queue full, cancellation, stop, anon'
+echo 'PASS: TOP pool, FGS permits, WRR/FIFO, reclaim, bypass, cancel, stop, anon'

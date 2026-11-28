@@ -65,6 +65,7 @@
 #include <linux/sched/sysctl.h>
 
 #include "internal.h"
+#include "mem_alloc_qos.h"
 #include "swap.h"
 
 #define CREATE_TRACE_POINTS
@@ -2143,7 +2144,14 @@ keep:
 
 	mem_cgroup_uncharge_list(&free_folios);
 	try_to_unmap_flush();
-	free_unref_page_list(&free_folios);
+#ifdef CONFIG_MEM_ALLOC_QOS
+	if (static_branch_unlikely(&mem_qos_reclaim_key) && current_is_kswapd() &&
+	    global_reclaim(sc))
+		/* Reserved pages are unavailable to the ordinary allocator. */
+		nr_reclaimed -= free_unref_page_list_qos(&free_folios);
+	else
+#endif
+		free_unref_page_list(&free_folios);
 
 	list_splice(&ret_folios, folio_list);
 	count_vm_events(PGACTIVATE, pgactivate);

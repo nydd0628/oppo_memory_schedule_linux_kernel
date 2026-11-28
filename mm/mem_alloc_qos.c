@@ -22,7 +22,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/mem_alloc_qos.h>
 
-#define QOS_ROLES	2
 #define QOS_MAX_BATCH	16
 #define QOS_MAX_GRANTS	8
 #define QOS_MAX_PAGES	128
@@ -44,6 +43,7 @@ enum qos_reason {
 	QOS_STOP,
 	QOS_EXPLICIT,
 	QOS_PAGE_INVALID,
+	QOS_POOL_EXCLUDED,
 	QOS_NR_REASONS,
 };
 
@@ -78,7 +78,8 @@ struct qos_counts {
 	u64 obtained, delivered, returned, rejected;
 	u64 enqueued[QOS_ROLES], granted[QOS_ROLES], claimed[QOS_ROLES];
 	u64 revoked[QOS_ROLES], dual[QOS_ROLES], single[QOS_ROLES];
-	u64 reason[QOS_NR_REASONS];
+	u64 reason[QOS_NR_REASONS], fgs_bypass[QOS_NR_REASONS];
+	u64 permits_used, reclaim_added, ordinary_added, pressure_pauses;
 	u64 max_head_ns[QOS_ROLES];
 	u32 peak, initialized, refill_batches, refill_empty, pauses;
 	u64 init_ns;
@@ -95,9 +96,9 @@ struct qos_session {
 	struct list_head queues[QOS_ROLES], granted, unused_requests;
 	struct qos_page *pages;
 	struct qos_request *requests;
-	u32 f, g, r, retiring, queued[QOS_ROLES], live_requests, cursor;
+	u32 f, g, r, retiring, permits, queued[QOS_ROLES], live_requests, cursor;
 	u32 failures;
-	bool refill_pending, paused;
+	bool refill_pending, paused, pressure_paused;
 	u64 page_seq, enqueue_seq, grant_seq;
 	atomic64_t call_seq;
 	atomic64_t paths[QOS_ROLES][QOS_NR_PATHS][2];
@@ -119,6 +120,7 @@ static struct pid *pending_pids[QOS_ROLES];
 static u64 pending_generation;
 static const char *qos_config_error;
 DEFINE_STATIC_KEY_FALSE(mem_qos_anon_key);
+DEFINE_STATIC_KEY_FALSE(mem_qos_reclaim_key);
 
 static void qos_request_event(const struct mem_qos_call *call, const char *phase,
 			      int detail, u64 page, u64 ordinal, u32 top, u32 fgs)
@@ -167,7 +169,10 @@ bool mem_qos_begin(struct mem_qos_call *call, enum mem_qos_domain domain,
 	call->parent = parent;
 	call->role = role;
 	call->domain = domain;
-	call->force = force && domain == QOS_DRIVER && q.cfg.mode != QOS_N;
+	call->gate = role == QOS_FGS && q.cfg.mode >= QOS_FIFO;
+	call->permitted = false;
+	call->force = force && domain == QOS_DRIVER &&
+		      (call->gate || (role == QOS_TOP && q.cfg.mode != QOS_N));
 	qos_request_event(call, "enter", call->force, 0, 0, 0, 0);
 	return true;
 out:
@@ -177,7 +182,7 @@ out:
 
 void mem_qos_end(struct mem_qos_call *call, enum mem_qos_path path, bool success)
 {
-	if (q.cfg.trace)
+	if (q.cfg.trace || path == QOS_PERMITTED || path == QOS_FGS_BYPASS)
 		atomic64_inc(&q.paths[call->role][path][success]);
 	qos_request_event(call, "return", 2 * path + success, 0, 0, 0, 0);
 	srcu_read_unlock(&qos_srcu, call->srcu_index);
@@ -203,15 +208,23 @@ static void qos_notify(struct qos_request *req)
 	spin_unlock(&q.lock);
 }
 
-static void qos_count_reason(const struct mem_qos_call *call, enum qos_reason why)
+static void qos_record_reason(const struct mem_qos_call *call, enum qos_reason why)
 {
 	q.counts.reason[why]++;
+	if (call->gate && (why != QOS_EXPLICIT || call->domain != QOS_DRIVER))
+		q.counts.fgs_bypass[why]++;
+}
+
+static void qos_count_reason(const struct mem_qos_call *call, enum qos_reason why)
+{
+	qos_record_reason(call, why);
 	qos_event_locked(call, "fallback", why, 0, 0);
 }
 
 static bool qos_page_valid(struct page *page)
 {
-	return page_zonenum(page) == ZONE_NORMAL && !page_is_pfmemalloc(page) &&
+	return page_zonenum(page) == ZONE_NORMAL && !PageHWPoison(page) &&
+	       !page_is_pfmemalloc(page) &&
 	       migratetype_is_mergeable(get_pageblock_migratetype(page));
 }
 
@@ -227,6 +240,27 @@ static struct page *qos_detach_page(struct qos_page *slot)
 static unsigned int qos_occupancy(void)
 {
 	return q.f + q.g + q.r + q.retiring;
+}
+
+static bool qos_pressure_allows_refill(struct zone *zone)
+{
+	unsigned long mark = q.pressure_paused ? low_wmark_pages(zone) : min_wmark_pages(zone);
+	bool paused = !zone_watermark_ok_safe(zone, 0, mark, ZONE_NORMAL);
+
+	if (paused != q.pressure_paused) {
+		q.pressure_paused = paused;
+		if (paused)
+			q.counts.pressure_pauses++;
+		qos_pool_event(paused ? "pressure_pause" : "pressure_resume", 0, 0);
+	}
+	return !paused;
+}
+
+static gfp_t qos_pool_gfp(void)
+{
+	gfp_t gfp = q.cfg.domain == QOS_DRIVER ? QOS_DRIVER_GFP : QOS_ANON_GFP;
+
+	return (gfp & ~(__GFP_RECLAIM | __GFP_CMA)) | __GFP_NOMEMALLOC | __GFP_NOWARN;
 }
 
 static void qos_kick_refill_locked(void)
@@ -267,6 +301,7 @@ static void qos_record_head_age(const struct qos_request *req, ktime_t now)
 static void qos_cancel_locked(struct qos_request *req, enum qos_reason reason)
 {
 	struct qos_page *slot = req->page;
+	bool granted = req->state == QOS_GRANTED;
 
 	if (!slot && q.queues[req->call->role].next == &req->link)
 		qos_record_head_age(req, ktime_get());
@@ -277,12 +312,15 @@ static void qos_cancel_locked(struct qos_request *req, enum qos_reason reason)
 		list_add(&slot->link, &q.free_pages);
 		req->page = NULL;
 		q.counts.revoked[req->call->role]++;
+	} else if (granted) {
+		q.permits--;
+		q.counts.revoked[QOS_FGS]++;
 	} else {
 		q.queued[req->call->role]--;
 	}
 	req->reason = reason;
-	q.counts.reason[reason]++;
-	qos_event_locked(req->call, slot ? "revoke" : "cancel", reason,
+	qos_record_reason(req->call, reason);
+	qos_event_locked(req->call, slot ? "revoke" : granted ? "revoke_permit" : "cancel", reason,
 			 slot ? slot->id : 0, req->grant_seq);
 	WRITE_ONCE(req->state, QOS_ABORTED);
 }
@@ -293,7 +331,7 @@ static struct qos_request *qos_head(int role)
 }
 
 /* Expire both heads before selecting a slot. Live heads are ordered by enqueue time. */
-static struct qos_request *qos_pick_locked(ktime_t now, bool *dual)
+static struct qos_request *qos_pick_locked(ktime_t now, bool top_has_page, bool *dual)
 {
 	struct qos_request *top = qos_head(0);
 	struct qos_request *fgs = qos_head(1);
@@ -303,6 +341,8 @@ static struct qos_request *qos_pick_locked(ktime_t now, bool *dual)
 		return top;
 	if (fgs && !ktime_before(now, fgs->deadline))
 		return fgs;
+	if (!top_has_page)
+		top = NULL;
 	if (!top || !fgs)
 		return top ?: fgs;
 
@@ -334,7 +374,8 @@ static bool qos_dispatch_batch(bool manual)
 		bool dual = false;
 		int role;
 
-		req = qos_pick_locked(now, &dual);
+		slot = list_first_entry_or_null(&q.free_pages, struct qos_page, link);
+		req = qos_pick_locked(now, !!slot, &dual);
 		if (!req)
 			break;
 		if (!ktime_before(now, req->deadline)) {
@@ -342,11 +383,7 @@ static bool qos_dispatch_batch(bool manual)
 			notify[nr_notify++] = req;
 			continue;
 		}
-		slot = list_first_entry_or_null(&q.free_pages, struct qos_page, link);
-		if (!slot)
-			break;
-
-		if (!qos_page_valid(slot->page)) {
+		if (slot && qos_head(QOS_TOP) && !qos_page_valid(slot->page)) {
 			list_del(&slot->link);
 			q.f--;
 			q.retiring++;
@@ -361,12 +398,17 @@ static bool qos_dispatch_batch(bool manual)
 			continue;
 		}
 
-		list_del(&slot->link);
-		q.f--;
 		role = req->call->role;
 		qos_record_head_age(req, now);
 		q.queued[role]--;
-		q.g++;
+		if (role == QOS_TOP) {
+			list_del(&slot->link);
+			q.f--;
+			q.g++;
+		} else {
+			slot = NULL;
+			q.permits++;
+		}
 		req->page = slot;
 		req->grant_seq = ++q.grant_seq;
 		list_move_tail(&req->link, &q.granted);
@@ -386,9 +428,11 @@ static bool qos_dispatch_batch(bool manual)
 		refcount_inc(&req->refs);
 		WRITE_ONCE(req->state, QOS_GRANTED);
 		notify[nr_notify++] = req;
-		qos_event_locked(req->call, "grant", dual, slot->id, req->grant_seq);
+		qos_event_locked(req->call, slot ? "grant" : "grant_permit", dual,
+				 slot ? slot->id : 0, req->grant_seq);
 	}
-	more = i == q.cfg.grant_batch && (q.queued[0] || q.queued[1]) && q.f;
+	more = i == q.cfg.grant_batch &&
+	       ((q.queued[QOS_TOP] && q.f) || q.queued[QOS_FGS]);
 	qos_kick_refill_locked();
 	spin_unlock(&q.lock);
 
@@ -444,7 +488,14 @@ static struct page *qos_wait(struct qos_request *req)
 		qos_request_put_locked(req);
 	}
 
-	if (req->state == QOS_GRANTED) {
+	if (req->state == QOS_GRANTED && !req->page) {
+		q.permits--;
+		q.counts.permits_used++;
+		req->call->permitted = true;
+		qos_drop_list_ref_locked(req);
+		qos_event_locked(req->call, "claim_permit", 0, 0, req->grant_seq);
+		WRITE_ONCE(req->state, QOS_COMPLETE);
+	} else if (req->state == QOS_GRANTED) {
 		slot = req->page;
 		req->page = NULL;
 		q.g--;
@@ -481,8 +532,8 @@ static struct page *qos_wait(struct qos_request *req)
 	return page;
 }
 
-struct page *mem_qos_slowpath(struct mem_qos_call *call, gfp_t gfp,
-			      struct zone *preferred_zone)
+struct page *mem_qos_request(struct mem_qos_call *call, gfp_t gfp,
+			     struct zone *preferred_zone)
 {
 	struct qos_request *req;
 	struct qos_page *slot;
@@ -512,13 +563,17 @@ struct page *mem_qos_slowpath(struct mem_qos_call *call, gfp_t gfp,
 		reason = QOS_GFP;
 		goto fallback;
 	}
-	if (!preferred_zone || !cpuset_zone_allowed(&NODE_DATA(0)->node_zones[ZONE_NORMAL],
-						    gfp | __GFP_HARDWALL)) {
+	if ((!call->gate && !preferred_zone) ||
+	    !cpuset_zone_allowed(&NODE_DATA(0)->node_zones[ZONE_NORMAL], gfp | __GFP_HARDWALL)) {
 		reason = QOS_ZONE;
 		goto fallback;
 	}
 
 	if (q.cfg.mode == QOS_P) {
+		if (call->role == QOS_FGS) {
+			reason = QOS_POOL_EXCLUDED;
+			goto fallback;
+		}
 		slot = list_first_entry_or_null(&q.free_pages, struct qos_page, link);
 		if (!slot) {
 			reason = QOS_EMPTY;
@@ -592,14 +647,103 @@ static bool qos_inject_failure(void)
 	return fail;
 }
 
+/* Consume the reservation and publish prepared pages, with one owner each. */
+static unsigned int qos_publish_pages(struct page **pages, unsigned int reserved,
+				      unsigned int allocated, bool publish,
+				      unsigned int *discard)
+{
+	unsigned int i, added = 0;
+
+	q.r -= reserved;
+	q.counts.obtained += allocated;
+	for (i = 0; i < allocated; i++) {
+		struct qos_page *slot;
+		struct page *page = pages[i];
+
+		if (!publish || !qos_page_valid(page)) {
+			q.retiring++;
+			q.counts.rejected++;
+			pages[(*discard)++] = page;
+			continue;
+		}
+		slot = list_first_entry(&q.unused_pages, struct qos_page, link);
+		slot->page = page;
+		slot->id = ++q.page_seq;
+		list_move_tail(&slot->link, &q.free_pages);
+		q.f++;
+		added++;
+	}
+	return added;
+}
+
+/* Called after normal free preparation but before the pages enter PCP/buddy. */
+unsigned int mem_qos_capture_reclaimed(struct list_head *pages)
+{
+	struct zone *zone = &NODE_DATA(0)->node_zones[ZONE_NORMAL];
+	struct list_head *pos = pages->next;
+	unsigned int taken = 0;
+	int index;
+
+	if (list_empty(pages) || !rcu_access_pointer(qos_active))
+		return 0;
+	index = srcu_read_lock(&qos_srcu);
+	if (!srcu_dereference(qos_active, &qos_srcu))
+		goto out;
+
+	while (pos != pages) {
+		struct page *batch[QOS_MAX_BATCH];
+		unsigned int nr, prepared = 0, discard = 0, added;
+		u64 start_ns = ktime_get_ns();
+		gfp_t gfp = qos_pool_gfp();
+
+		spin_lock(&q.lock);
+		if (q.state != QOS_ACTIVE || q.cfg.mode == QOS_N ||
+		    qos_occupancy() >= q.cfg.target || !qos_pressure_allows_refill(zone)) {
+			spin_unlock(&q.lock);
+			break;
+		}
+		nr = min(q.cfg.refill_batch, q.cfg.target - qos_occupancy());
+		q.r += nr;
+		q.counts.peak = max(q.counts.peak, qos_occupancy());
+		spin_unlock(&q.lock);
+
+		while (pos != pages && prepared < nr) {
+			struct page *page = list_entry(pos, struct page, lru);
+
+			pos = pos->next;
+			if (mem_qos_prepare_reclaimed(page, gfp))
+				batch[prepared++] = page;
+		}
+
+		spin_lock(&q.lock);
+		added = qos_publish_pages(batch, nr, prepared, q.state == QOS_ACTIVE &&
+					  qos_pressure_allows_refill(zone), &discard);
+		q.counts.reclaim_added += added;
+		if (added) {
+			q.paused = false;
+			q.failures = 0;
+			qos_pool_event("reclaim_batch", added, ktime_get_ns() - start_ns);
+		}
+		spin_unlock(&q.lock);
+		qos_retire_pages(batch, discard);
+		taken += added;
+	}
+	if (taken)
+		qos_dispatch();
+out:
+	srcu_read_unlock(&qos_srcu, index);
+	return taken;
+}
+
 /*
  * The normal allocator returns fully prepared pages. Preserve the domain's
  * placement, zeroing and KASAN flags, but never use CMA, reclaim or reserves.
  */
 static bool qos_fill_batch(bool init)
 {
+	struct zone *zone = &NODE_DATA(0)->node_zones[ZONE_NORMAL];
 	struct page *pages[QOS_MAX_BATCH];
-	unsigned int i, nr, allocated, got = 0, nr_discard = 0;
+	unsigned int i, nr, got, nr_discard = 0;
 	u64 started;
 	gfp_t gfp;
 
@@ -611,15 +755,19 @@ static bool qos_fill_batch(bool init)
 	}
 	nr = min(init ? q.cfg.init_batch : q.cfg.refill_batch,
 		 min(q.cfg.target, q.cfg.max) - qos_occupancy());
+	/* During reclaim, prefer newly returned pages over taking free pages. */
+	if (!init && (!qos_pressure_allows_refill(zone) ||
+	    !zone_watermark_ok_safe(zone, 0, high_wmark_pages(zone) + nr, ZONE_NORMAL))) {
+		spin_unlock(&q.lock);
+		return false;
+	}
 	q.r += nr;
 	q.counts.peak = max(q.counts.peak, qos_occupancy());
 	qos_pool_event(init ? "init_reserve" : "refill_reserve", nr, 0);
 	spin_unlock(&q.lock);
 
 	started = ktime_get_ns();
-	gfp = q.cfg.domain == QOS_DRIVER ? QOS_DRIVER_GFP : QOS_ANON_GFP;
-	gfp &= ~(__GFP_RECLAIM | __GFP_CMA);
-	gfp |= __GFP_NOMEMALLOC | __GFP_NOWARN;
+	gfp = qos_pool_gfp();
 	for (i = 0; i < nr; i++) {
 		if (qos_inject_failure())
 			break;
@@ -629,31 +777,12 @@ static bool qos_fill_batch(bool init)
 	}
 
 	spin_lock(&q.lock);
-	allocated = i;
-	q.r -= nr;
-	q.counts.obtained += allocated;
-	for (i = 0; i < allocated; i++) {
-		struct qos_page *slot;
-		struct page *page = pages[i];
-
-		if (q.state != (init ? QOS_STARTING : QOS_ACTIVE) ||
-		    !qos_page_valid(page)) {
-			q.retiring++;
-			q.counts.rejected++;
-			pages[nr_discard++] = page;
-			continue;
-		}
-
-		slot = list_first_entry(&q.unused_pages, struct qos_page, link);
-		slot->page = page;
-		slot->id = ++q.page_seq;
-		list_move_tail(&slot->link, &q.free_pages);
-		q.f++;
-		got++;
-	}
+	got = qos_publish_pages(pages, nr, i, q.state == (init ? QOS_STARTING : QOS_ACTIVE),
+				&nr_discard);
 	if (init) {
 		q.counts.initialized += got;
 	} else {
+		q.counts.ordinary_added += got;
 		q.counts.refill_batches++;
 		if (got)
 			q.failures = 0;
@@ -753,9 +882,9 @@ static int qos_start(void)
 	q.generation++;
 	q.state = QOS_STARTING;
 	q.cursor = 0;
-	q.f = q.g = q.r = q.retiring = q.live_requests = 0;
+	q.f = q.g = q.r = q.retiring = q.permits = q.live_requests = 0;
 	q.failures = 0;
-	q.paused = q.refill_pending = false;
+	q.paused = q.pressure_paused = q.refill_pending = false;
 	q.page_seq = q.enqueue_seq = q.grant_seq = 0;
 	memset(&q.counts, 0, sizeof(q.counts));
 	memset(q.paths, 0, sizeof(q.paths));
@@ -803,6 +932,8 @@ static int qos_start(void)
 	rcu_assign_pointer(qos_active, &q);
 	if (q.cfg.domain == QOS_ANON)
 		static_branch_enable(&mem_qos_anon_key);
+	if (q.cfg.mode != QOS_N)
+		static_branch_enable(&mem_qos_reclaim_key);
 	return 0;
 
 failed:
@@ -846,12 +977,15 @@ static void qos_stop(void)
 	spin_unlock(&q.lock);
 	if (q.cfg.domain == QOS_ANON)
 		static_branch_disable(&mem_qos_anon_key);
+	if (q.cfg.mode != QOS_N)
+		static_branch_disable(&mem_qos_reclaim_key);
 	hrtimer_cancel(&q.retry_timer);
 	cancel_work_sync(&q.refill_work);
 	qos_drain();
 	synchronize_srcu(&qos_srcu);
 
-	WARN_ON_ONCE(q.g || q.r || q.retiring || q.live_requests || q.queued[0] || q.queued[1]);
+	WARN_ON_ONCE(q.g || q.r || q.retiring || q.permits || q.live_requests ||
+		     q.queued[QOS_TOP] || q.queued[QOS_FGS]);
 	qos_free_storage();
 	WARN_ON_ONCE(q.counts.obtained != q.counts.delivered + q.counts.returned);
 	for (role = 0; role < QOS_ROLES; role++) {
@@ -859,7 +993,7 @@ static void qos_stop(void)
 		q.pids[role] = NULL;
 	}
 
-	q.refill_pending = q.paused = false;
+	q.refill_pending = q.paused = q.pressure_paused = false;
 	q.test_manual = false;
 	q.test_hold_role = -1;
 	q.state = QOS_OFF;
@@ -869,10 +1003,12 @@ static void qos_stop(void)
 static const char * const qos_modes[] = { "N", "P", "F", "W" };
 static const char * const qos_domains[] = { "driver", "anon" };
 static const char * const qos_states[] = { "OFF", "STARTING", "ACTIVE", "DRAINING" };
-static const char * const qos_paths[] = { "fast", "slow", "pool", "rejected", "cancelled" };
+static const char * const qos_paths[] = {
+	"fast", "slow", "pool", "rejected", "cancelled", "permitted", "fgs_bypass",
+};
 static const char * const qos_reasons[] = {
 	"native", "context", "gfp", "zone", "empty", "full", "no_desc", "expired",
-	"signal", "stop", "explicit", "page_invalid",
+	"signal", "stop", "explicit", "page_invalid", "pool_excluded",
 };
 
 static void qos_print_config(struct seq_file *m, const char *prefix,
@@ -889,8 +1025,8 @@ static void qos_print_config(struct seq_file *m, const char *prefix,
 static int qos_status_show(struct seq_file *m, void *unused)
 {
 	struct qos_counts counts;
-	u32 f, g, r, retiring, queued[QOS_ROLES], live, cursor, failures;
-	bool paused, refill_pending;
+	u32 f, g, r, retiring, permits, queued[QOS_ROLES], live, cursor, failures;
+	bool paused, refill_pending, pressure_paused;
 	unsigned int role, i;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -903,12 +1039,14 @@ static int qos_status_show(struct seq_file *m, void *unused)
 	g = q.g;
 	r = q.r;
 	retiring = q.retiring;
+	permits = q.permits;
 	queued[0] = q.queued[0];
 	queued[1] = q.queued[1];
 	live = q.live_requests;
 	cursor = q.cursor;
 	failures = q.failures;
 	paused = q.paused;
+	pressure_paused = q.pressure_paused;
 	refill_pending = q.refill_pending;
 	spin_unlock(&q.lock);
 
@@ -926,8 +1064,11 @@ static int qos_status_show(struct seq_file *m, void *unused)
 	seq_printf(m, "refill batches=%u empty=%u failures=%u pauses=%u paused=%u pending=%u\n",
 		   counts.refill_batches, counts.refill_empty, failures,
 		   counts.pauses, paused, refill_pending);
-	seq_printf(m, "queue top=%u fgs=%u live=%u cursor=%u\n",
-		   queued[0], queued[1], live, cursor);
+	seq_printf(m, "refill_sources reclaim=%llu ordinary=%llu pressure_pauses=%llu pressure_paused=%u\n",
+		   counts.reclaim_added, counts.ordinary_added, counts.pressure_pauses,
+		   pressure_paused);
+	seq_printf(m, "queue top=%u fgs=%u live=%u cursor=%u permits_pending=%u permits_used=%llu\n",
+		   queued[0], queued[1], live, cursor, permits, counts.permits_used);
 	seq_printf(m, "test manual=%u hold_role=%d fail_after=%d\n",
 		   q.test_manual, q.test_hold_role, READ_ONCE(q.test_fail_after));
 	for (role = 0; role < QOS_ROLES; role++) {
@@ -944,6 +1085,10 @@ static int qos_status_show(struct seq_file *m, void *unused)
 	seq_puts(m, "reasons");
 	for (i = 0; i < QOS_NR_REASONS; i++)
 		seq_printf(m, " %s=%llu", qos_reasons[i], counts.reason[i]);
+	seq_putc(m, '\n');
+	seq_puts(m, "fgs_bypass");
+	for (i = 0; i < QOS_NR_REASONS; i++)
+		seq_printf(m, " %s=%llu", qos_reasons[i], counts.fgs_bypass[i]);
 	seq_putc(m, '\n');
 	mutex_unlock(&qos_control_lock);
 	return 0;
@@ -1125,6 +1270,27 @@ static int qos_cancel(char **argv)
 	return 0;
 }
 
+/* Exercise the reclaim free/capture path using only disposable driver pages. */
+static int qos_test_reclaim(unsigned int nr)
+{
+	LIST_HEAD(pages);
+	unsigned int i;
+
+	if (q.state != QOS_ACTIVE || q.cfg.mode == QOS_N)
+		return -EINVAL;
+	for (i = 0; i < nr; i++) {
+		struct page *page = alloc_pages_node(0, qos_pool_gfp(), 0);
+
+		if (!page)
+			break;
+		memset(page_address(page), 0xa5, PAGE_SIZE);
+		if (put_page_testzero(page))
+			list_add_tail(&page->lru, &pages);
+	}
+	free_unref_page_list_qos(&pages);
+	return i == nr ? 0 : -ENOMEM;
+}
+
 /* Fault injection and manual service are confined to the driver domain. */
 static int qos_test_control(char **argv, int argc)
 {
@@ -1139,6 +1305,8 @@ static int qos_test_control(char **argv, int argc)
 	}
 	if (argc != 2 || kstrtoint(argv[1], 10, &val))
 		return -EINVAL;
+	if (!strcmp(op, "reclaim") && val > 0 && val <= QOS_MAX_PAGES)
+		return qos_test_reclaim(val);
 
 	spin_lock(&q.lock);
 	if (!strcmp(op, "manual") && (val == 0 || val == 1)) {

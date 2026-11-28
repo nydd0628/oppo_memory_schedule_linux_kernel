@@ -2628,6 +2628,25 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 	trace_android_vh_test_clear_look_around_ref(page);
 }
 
+#ifdef CONFIG_MEM_ALLOC_QOS
+/* The reclaim free path has already run free_unref_page_prepare(). */
+bool mem_qos_prepare_reclaimed(struct page *page, gfp_t gfp)
+{
+	struct zone *zone = page_zone(page);
+	int mt = get_pageblock_migratetype(page);
+
+	if (zone_idx(zone) != ZONE_NORMAL || has_isolate_pageblock(zone) ||
+	    PageHWPoison(page) || page_count(page) ||
+	    !migratetype_is_mergeable(mt) || mt != get_pcppage_migratetype(page))
+		return false;
+
+	list_del_init(&page->lru);
+	prep_new_page(page, 0, gfp, 0);
+	kmsan_alloc_page(page, 0, gfp);
+	return true;
+}
+#endif
+
 /*
  * Go through the free lists for the given migratetype and remove
  * the smallest available page from the freelists
@@ -3660,7 +3679,8 @@ void free_unref_page(struct page *page, unsigned int order)
 /*
  * Free a list of 0-order pages
  */
-void free_unref_page_list(struct list_head *list)
+static __always_inline unsigned int
+free_unref_page_list_internal(struct list_head *list, bool qos_reclaim)
 {
 	unsigned long __maybe_unused UP_flags;
 	struct page *page, *next;
@@ -3668,6 +3688,7 @@ void free_unref_page_list(struct list_head *list)
 	struct zone *locked_zone = NULL;
 	int batch_count = 0;
 	int migratetype;
+	unsigned int captured = 0;
 
 	/* Prepare pages for freeing */
 	list_for_each_entry_safe(page, next, list, lru) {
@@ -3688,6 +3709,11 @@ void free_unref_page_list(struct list_head *list)
 			continue;
 		}
 	}
+
+#ifdef CONFIG_MEM_ALLOC_QOS
+	if (qos_reclaim)
+		captured = mem_qos_capture_reclaimed(list);
+#endif
 
 	list_for_each_entry_safe(page, next, list, lru) {
 		struct zone *zone = page_zone(page);
@@ -3747,7 +3773,20 @@ void free_unref_page_list(struct list_head *list)
 		pcp_spin_unlock(pcp);
 		pcp_trylock_finish(UP_flags);
 	}
+	return captured;
 }
+
+void free_unref_page_list(struct list_head *list)
+{
+	free_unref_page_list_internal(list, false);
+}
+
+#ifdef CONFIG_MEM_ALLOC_QOS
+unsigned int free_unref_page_list_qos(struct list_head *list)
+{
+	return free_unref_page_list_internal(list, true);
+}
+#endif
 
 /*
  * split_page takes a non-compound higher-order page, and splits it into
@@ -5798,7 +5837,7 @@ alloc_pages_internal(gfp_t gfp, unsigned int order, int preferred_nid,
 
 #ifdef CONFIG_MEM_ALLOC_QOS
 	if (qos) {
-		page = mem_qos_slowpath(qos, gfp, ac.preferred_zoneref->zone);
+		page = mem_qos_request(qos, gfp, ac.preferred_zoneref->zone);
 		if (IS_ERR(page)) {
 			*path = QOS_CANCELLED;
 			return NULL;
@@ -5844,7 +5883,19 @@ struct page *mem_qos_alloc_pages(gfp_t gfp, enum mem_qos_domain domain,
 	if (!mem_qos_begin(&call, domain, force, parent))
 		return __alloc_pages(gfp, 0, numa_node_id(), NULL);
 
-	page = alloc_pages_internal(gfp, 0, numa_node_id(), NULL, &call, &path);
+	if (call.gate) {
+		/* The background request has not entered the allocator yet. */
+		page = mem_qos_request(&call, current_gfp_context(gfp & gfp_allowed_mask), NULL);
+		if (IS_ERR(page)) {
+			path = QOS_CANCELLED;
+			page = NULL;
+		} else {
+			page = __alloc_pages(gfp, 0, numa_node_id(), NULL);
+			path = call.permitted ? QOS_PERMITTED : QOS_FGS_BYPASS;
+		}
+	} else {
+		page = alloc_pages_internal(gfp, 0, numa_node_id(), NULL, &call, &path);
+	}
 	mem_qos_end(&call, path, !!page);
 	return path == QOS_CANCELLED ? ERR_PTR(-ECANCELED) : page;
 }
