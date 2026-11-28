@@ -1,43 +1,50 @@
 # Android 内存分配 QoS 实现交接
 
-**Pixel 7（pantah）· 2026-11-28 · 分支 `memory-QoS`**
+**V2 · 前台专池与后台分配许可 · Pixel 7（pantah）· 分支 `memory-QoS`**
 
-基线是 `6.1.124-android14-11-g8769cc47188c` 对应的源码提交 `8769cc47188c3bdca2a34d39ba0f39a945b85465`。实现和自测在其直接子提交 `6243d7eb29ff`。原 V8 实验的末端 `c9f2088ef73d` 仍可从 `fg-page-pool` 分支查阅。设计和测试口径见原输入稿。[详细设计](01-Android内存分配QoS详细设计.md) · [测试计划](02-Android内存分配QoS测试计划.md)
+内核基线是 `6.1.124-android14-11-g8769cc47188c`。旧实验提交 `6243d7eb29ff` 的前后台共用一个池，双方都在原生快路径失败后排队。当前实现提交 `9222cb89417c` 改为前台专池、后台许可和 `kswapd` 回收补池。原设计和用例可查 01、02，涉及后台入口和授权定义的地方以本文为准。[原详细设计](01-Android内存分配QoS详细设计.md) · [原测试计划](02-Android内存分配QoS测试计划.md)
 
-## 1　入口及支持范围
+## 1　申请从哪里进入
 
-| 位置 | 实现 | 核查点 |
-|---|---|---|
-| `mm/page_alloc.c` | `alloc_pages_internal()` 复用原生分配逻辑。受控调用通过 `mem_qos_alloc_pages()` 进入，在首轮 `get_page_from_freelist()` 失败后、`__alloc_pages_slowpath()` 之前尝试 QoS | 快速成功直接返回。旁路及等待结束后的回退沿用该次调用原有 GFP 和分配上下文，直接执行原生慢路径一次 |
-| `mm/memory.c` | `do_anonymous_page()` 中，静态分支启用后只标记本进程用户态私有匿名缺页的数据页分配 | 接入点在 `anon_vma_prepare()` 后。页表页、共享零页读取、COW、换入和高阶页均走各自原生入口 |
-| `mm/mem_alloc_qos.c` | 同一会话选择 `driver` 或 `anon` 域。两个明确登记的 TGID 对应 TOP/FGS，分别持有 `struct pid` 引用 | 使用进程对象匹配，整数 PID 复用时新进程不会继承权限。全局 `__alloc_pages()` 的普通调用从未标记的入口执行 |
-| `mm/Kconfig`、`arch/arm64/configs/gki_defconfig` | `CONFIG_MEM_ALLOC_QOS` 选中 ARM64、非 NUMA、支持高精度定时器和 tracing 的实验配置。GKI 构建启用代码，开机状态为 OFF | ARM64 GKI 仍使用 4 KiB 页。开机未创建页池、未登记角色，匿名入口的静态分支关闭 |
+| 对象 | 开始分配时 | 进入队列后 | 退出 |
+|---|---|---|---|
+| TOP 前台，F/W | 先尝试一次原生快路径。成功就直接交付。相容的失败请求才排队。 | 获选时绑定一张前台专池的实体页，恢复运行后领取。 | 池页直接返回分配调用方。超时、队满或停机等使用本次请求原有的原生慢路径。 |
+| FGS 后台，F/W | 在调用普通页分配器之前核对条件。相容请求直接排队。 | 获选时得到可消费一次的许可。领取许可后，由原请求线程调用普通页分配器，走原有快慢路径。 | 许可与实际分配结果分别统计。队满、超时、信号或停机等可旁路到原生分配，分别记原因及成功、失败结果。 |
+| N 原生 | 两边走原生快慢路径。 | 可配置会话观测路径。 | 池和仲裁都关闭。 |
+| P 仅池 | TOP 先尝试快路径，失败后尝试立即取一张池页。FGS 走原生快慢路径。 | 两边都无需排队。 | 这个模式用于单独测前台备页的代价和收益。 |
 
-`driver` 域使用 `GFP_KERNEL | __GFP_ZERO`。`anon` 域复用该基线 ARM64 匿名分配的 `GFP_HIGHUSER_MOVABLE | __GFP_ZERO | __GFP_CMA | __GFP_COMP`。匿名请求的 `__GFP_CMA` 表示**允许**使用 CMA，QoS 只提供其中合格的非 CMA 页，原生快路径和回退仍可按原规则使用 CMA。MTE 请求带 `__GFP_ZEROTAGS`，因此从池入口旁路，继续由原生分配处理标签。在单节点上仅接收 `ZONE_NORMAL` 的普通页块，核对 cpuset、GFP 作用域、睡眠和紧急储备相关上下文。其他调用点、NUMA 策略和高阶分配目前没有 QoS 接入。
+许可最多触发一次原生分配调用。这个调用仍可能直接回收、失败或比前台晚完成。FGS 旁路也只调用一次原生分配器。驱动显式取消返回 `ECANCELED`。匿名缺页的显式取消按原生语义继续分配。
 
-池页由普通分配器完成零填充、架构分配、页引用初始化、KASAN 和页检查处理，交付时直接转移已经准备好的页引用。原生 `mm_page_alloc` 与 page owner 记录的是物理页从分配器出来的时刻和堆栈。QoS 领取时使用自己的 `claim`／`take` 事件。匿名页领取后仍执行 `mem_cgroup_charge()`、swaprate throttle、uptodate、PTE 锁内重检、rmap/LRU 和 `set_pte_at()`。计费或安装失败由原匿名缺页路径释放。QoS 层的 `return pool_ok` 与最终用户态触页成功应分别统计。
+### 接入位置及检查
 
-## 2　请求怎样取得页
+- `mm/page_alloc.c` 的 `mem_qos_alloc_pages()` 在真正进入 `__alloc_pages()` 前处理 FGS 许可。TOP 的接入仍位于第一次 `get_page_from_freelist()` 失败后、`__alloc_pages_slowpath()` 之前。普通分配的入口使用相同的原生逻辑。
+- `mm/memory.c` 的 `do_anonymous_page()` 只标记本进程用户态私有匿名缺页的数据页。辅助页表页、COW、换入和高阶页走各自原生路径。参与会话的两个进程由有权限的控制端显式登记，`struct pid` 引用隔离数字 PID 的复用。
+- 会话选择 `driver` 或 `anon` 域。池只接收 ARM64 单节点 `ZONE_NORMAL` 的兼容 order-0 页，检查 GFP、cpuset、睡眠、紧急储备等边界。匿名 MTE 页需要不同的标签初始化，走原生路径。池页不依赖 CMA。
+- 匿名页交付后仍由原缺页函数执行 memcg 计费、swaprate throttle、uptodate、PTE 锁内复查、rmap/LRU 和页表安装。上层失败沿用其原有释放路径。池页交付、FGS 原生取得页和应用触页完成分别统计。
 
-1. **开始。** 会话在登记进程的受控入口通过 SRCU 固定生命周期。追踪档位 2 在分配前生成请求编号并记录 `enter`，档位 0/1 仅在需要仲裁的慢请求生成编号。原生快路径无需 QoS 描述符或仲裁锁。
-2. **入队。** F/W 模式先核对条件、每类队长及描述符余额。描述符在启动时预分配，数量为 `2 × depth + max`。入队锁内存下绝对截止时间和全局入队序号。P 模式尝试直接领取一页，池空走慢路径。
-3. **授权。** 一个锁保护两条 FIFO、池和绑定。FIFO 比较两条队首的入队序号。WRR 在两个有效队首同时存在时按 TOP 槽再到 FGS 槽分配。每次成功绑定才推进游标。池空、单队服务以及撤销都不改变游标。授权批量限制了一次持锁内处理的请求／过期项／不可用页数。
-4. **交付。** 池页与请求一对一绑定后才发通知。调用者用状态谓词睡眠，锁内转移页引用。截止前已授权的请求在恢复时仍可领取。仍在排队的过期请求、信号中断和正常停机走原生慢路径。显式取消的驱动请求返回 `ECANCELED`，匿名缺页继续原生分配。已授权未领取的页可被撤销，已交付的页归调用者。
-5. **回收描述符。** 调用者持有一个引用。排队到授权未领期间由链表持有一个引用。锁外唤醒有独立引用，或者接手已摘除的链表引用。最后一个引用退出才归还描述符。停机可以枚举尚未领取的授权。
+## 2　3∶1 在哪里生效
 
-W3 在双方一直积压、有相容页且无撤销时序列为 TOP、TOP、TOP、FGS。这个保证只约束仲裁服务机会。已经通过原生路径完成的请求，以及授权后线程何时恢复运行，均在该顺序之外。
+`mm/mem_alloc_qos.c` 用同一个自旋锁保护两个 FIFO、请求状态、槽位游标、绑定页和待领许可。F 从**当下可服务**的队首中按全局入队序号挑最早者。W 在两个队首都可服务时按权重轮转，W3 是三个 TOP 实体页授权加一个 FGS 分配许可。授权时游标向前一步，撤销不会倒拨。
 
-## 3　页池、补页及清理
+TOP 可服务需要队首未过期且池里有兼容页。FGS 可服务需要队首未过期。若前台池暂时空了，FGS 可以单独获得许可，双队轮转位置冻结。池补上后双方继续原来的位置。举例来说，分完两个 TOP 槽后池空，FGS 可获单独许可。等双方恢复可服务，先完成第三个 TOP 槽，再轮到 FGS。只有一个队列可服务时，同样冻结游标。3∶1 的统计分母是双方持续可服务期间的授权机会。实际成功比例、回退和后台完成率单报。
 
-- `F` 是空闲页，`G` 是已授权未领页，`R` 是工作项仍持有的补页预留槽。实现另记录 `retiring`，覆盖已移出池但正在锁外归还的页。预留时用 `F + G + R + retiring` 扣除已占容量，容量小于等于 `target`，同时受 `max` 约束。
-- STARTING 按 `init_batch` 分批备足目标量。部分失败时全部归还，`status` 保存实得页数、耗时和错误。启动完成后才开放入口。
-- 空闲页低于 `low` 且还缺页时，同一个工作项完成分批补页。补页 GFP 保留域内零填充与迁移类型属性，去掉 CMA、直接回收和 kswapd 回收，使用 `__GFP_NOMEMALLOC | __GFP_NOWARN`。普通分配器仍可按自己的水位逻辑返回失败。连续整批没有合格页时按高精度定时器退避，达到失败上限后暂停。用 `recover` 复位失败计数，低水位仍满足时恢复补页。
-- 停机先进入 DRAINING、撤下入口，再同步定时器及工作项，撤销排队和未领取的授权，等待 SRCU 区间退出，最后释放剩余池页及描述符。停机等待正在回退的分配调用返回。调用者已领取的页由调用者按原规则释放。
-- 静止核对式为 `obtained = F + G + delivered + returned`。运行时有待释放页时右侧另加 `retiring`。OFF 核对 `F=G=R=retiring=0`、`live=0`、`balanced=1`。两类队列的 `grants`、`claimed`、`revoked` 独立记录。P 的 `take` 增加 `claimed`，没有 `grant`。
+前台实体页或后台许可提交后才在锁外定向通知。每次领取和撤销由同一把锁裁决。前台池页在撤销后归池，后台撤销仅消除许可。停机路径撤下入口、同步补页工作、排空排队与未领授权，再等待在途 SRCU 调用退出后释放存量页。调用者已领取的页或正在执行的原生分配由调用者负责。
 
-## 4　实验接口
+## 3　刚回收的页怎么补进池
 
-设备端通过有权限的控制进程访问 `/sys/kernel/debug/mem_alloc_qos/`。`control` 和 `alloc` 是只写入口，`status` 是只读回执。需要挂载 debugfs，写入者需要 `CAP_SYS_ADMIN`。每条命令一次写入。
+1. **启动。** 复用原生无直接回收分配，分批预填到目标。部分失败时全量归还，服务保持 OFF。
+2. **优先接收回收页。** `mm/vmscan.c` 的 `shrink_folio_list()` 仅对全局 `kswapd` 回收的 order-0 释放批次，完成 memcg 解账和 TLB flush 后进入 QoS 释放链。普通直接回收、限定 memcg 回收和其他释放入口沿用原生流程。
+3. **在普通链之前接收。** `mm/page_alloc.c` 运行原有释放准备，再在进 PCP／buddy 前择取兼容页，直到池达到目标或这批候选用完。跳过硬件坏页、已隔离页块、CMA 和紧急储备类型。接收时用 `prep_new_page()` 恢复分配状态，处理零填充、KASAN、架构检查和页引用。池准备之外的剩余页继续走普通释放路径。
+4. **普通内存的保护线。** 普通空闲内存过不了 Zone MIN 检查时暂停补池，过了 LOW 检查再恢复。有余量时才收回收页。普通补页工作作为备用来源，只在预计扣掉本批后仍过得了 HIGH 检查时从原生分配器补。备用源本身不发起回收。达到普通补页连续失败上限时会暂停，成功接收回收页或执行 `recover` 可复位失败状态。水位约束仍独立生效。
+5. **回收进度对账。** 一批实际转入前台池的页从这次 `nr_reclaimed` 中扣除。池账独立记录每种来源。`kswapd` 按普通分配器实际得到的页计算回收进度，进度不足时沿用原有的回收判断。
+
+`F` 为空闲池页，`G` 为前台已授权未领的页，`R` 为补页预留槽，`retiring` 为准备还给普通分配器的页。合计受目标和最大容量约束。静止时 `obtained = F + G + delivered + returned`，有待退页时右侧加 `retiring`。停机检查 F/G/R/retiring 和 `live` 清零及 `balanced=1`。FGS 许可另有 `permits_pending` 和 `permits_used`，不占池容量，停机后 pending 也清零。
+
+Apple 公开的 XNU 将 *secluded memory* 用于改善内存紧张时的相机启动。此次借鉴了按用途隔离的少量库存，以及用不同水位暂停和恢复的思路。TOP/FGS 身份、W3 两类轮转、后台许可和回退规则属于本实验。XNU 按进程优先级处理内存压力的 Jetsam、应用冻结和压缩属于另一个控制层，留作独立对照。[XNU 专池与 Jetsam](https://github.com/apple-oss-distributions/xnu/blob/main/doc/vm/memorystatus.md#memory-monitoring) · [XNU 压力阈值](https://github.com/apple-oss-distributions/xnu/blob/main/doc/vm/memorystatus_notify.md#pressure-thresholds)
+
+## 4　控制和采集
+
+GKI 启用 `CONFIG_MEM_ALLOC_QOS`，开机状态 OFF。挂载 debugfs 后，由具备 `CAP_SYS_ADMIN` 的控制进程访问 `/sys/kernel/debug/mem_alloc_qos/`。配置命令格式与 V1 相同，模式的实际行为采用第 1 节。
 
 ```text
 config MODE DOMAIN TOP_WEIGHT FGS_WEIGHT TARGET MAX LOW REFILL_BATCH INIT_BATCH BACKOFF_US FAILURE_LIMIT DEPTH BUDGET_US GRANT_BATCH TRACE RUN_ID TOP_TGID FGS_TGID
@@ -47,16 +54,15 @@ recover
 cancel SESSION REQUEST_ID
 ```
 
-| 字段 | 取值与说明 |
+| 参数 | 规则 |
 |---|---|
-| `MODE` | 0=N，1=P，2=F，3=W。N 的池和队列字段均为零，P 的队列相关字段为零。非 W 的两个权重都填零。 |
-| `DOMAIN` | 0=driver，1=anon。两类身份填同一控制端 PID 命名空间下的存活 TGID，回执显示全局 TGID。 |
-| 池 | 启用时 `0 < low < target ≤ max ≤ 128`，两种补页批量均为 1–16，退避 500–8000 μs，失败上限 1–8 批。 |
-| 队列 | 每类深度 1–64，授权批量 1–8。匿名域预算 100–1000 μs。驱动域允许 100–1,000,000 μs，长预算用于可重复的人工步进。W 权重 TOP 为 1–4，FGS 为 1。 |
-| `TRACE` | 0 保留池、队列及对账的核心计数。1 加每类各路径结果计数。2 加定向 tracepoint，仍需由采集端启用 tracefs 事件。 |
-| `RUN_ID` | 非零 64 位整数，与负载采集目录关联。会话编号 `session` 由内核独立递增，`config_generation` 在整份配置成功提交后递增。 |
+| MODE，DOMAIN | MODE 为 0=N、1=P、2=F、3=W。DOMAIN 为 0=driver、1=anon。N 的池和队列字段为零，P 的队列字段为零。 |
+| 权重 | 仅 W 非零，TOP 1–4、FGS 1。F 比较两个可服务队首的入队序号。 |
+| 池 | `0 < low < target ≤ max ≤ 128`。启动和补页批量 1–16，退避 500–8000 μs，普通补页失败上限 1–8 批。 |
+| 排队 | 每类深度 1–64，授予批量 1–8。匿名域预算 100–1000 μs，驱动域最长 1,000,000 μs 供诊断。 |
+| 采集与身份 | TRACE 为 0 核心计数、1 加路径计数、2 加请求事件。后台许可实际成功及旁路结果在所有档位计数。RUN_ID 为非零 64 位整数，两个 TGID 需存活且不同。 |
 
-示例为 W3、匿名域、32 页、250 μs、计数档。先让两端停在共同 GO 屏障，再填入两端进程真实 TGID。
+示例配置使用匿名 W3、32 页、250 μs 和计数档。
 
 ```sh
 q=/sys/kernel/debug/mem_alloc_qos
@@ -64,59 +70,46 @@ printf 'config 3 1 3 1 32 32 16 4 4 1000 3 64 250 1 1 36001 %s %s\n' \
     "$top_tgid" "$fgs_tgid" > "$q/control"
 printf 'start\n' > "$q/control"
 cat "$q/status"
-# 采集结束后停止并保存最终回执。
+# 在负载完成后保存最后一次状态。
 printf 'stop\n' > "$q/control"
 cat "$q/status"
 ```
 
-`status` 依次给出构建版本与页大小、暂存配置、最近会话配置、池账、补页、队列、角色计数和旁路原因。`config_error` 报最近一次提交的字段、字段组或忙状态，失败不替换暂存配置。`start` 再次核对两个已登记进程仍存活。准备新会话前保存旧会话的回执和轨迹。
+`status` 的 `refill_sources` 区分 `reclaim`、`ordinary` 和水位暂停，启动预填数量单列为 `initialized`。后台的 `grants` 是授权次数，`permits_used` 是领取次数，`permitted_ok/fail` 是持许可进入原生分配器的结果。`fgs_bypass` 原因行与 `fgs_bypass_ok/fail` 结果分开保存。上面的 `claimed` 只计实体池页，后台应为零。
 
-仅 `driver` 域支持以下功能诊断。
+`driver` 域可向 `alloc` 写 `auto COOKIE HOLD_US` 或 `force COOKIE HOLD_US`。驱动会检查整页清零，写入内容，持有指定时间再释放。force 可以让前台跳过首次快路径用于诊断，后台在 F/W 使用 auto 就会进许可队列。诊断命令 `test manual 1`、`test step`、`test hold ROLE`、`test fail_after N` 用于控制授权、领取和普通补页。新增 `test reclaim N` 以 N 张写过数据的驱动页走同一条释放准备、接收和重新初始化路径。这些人工页也计入 `reclaim`，正式追回收来源的运行使用自然压力并关闭人工注入。
 
-| 接口 | 用途 |
+### 事件
+
+在 tracefs 设置 `trace_clock=mono` 并启用 `events/mem_alloc_qos/enable`。仍以 `session + id` 关联一次请求，以 `session + page` 关联池页的生命周期。
+
+| phase | 读法 |
 |---|---|
-| 向 `alloc` 写 `auto COOKIE HOLD_US` | 当前写入线程走正常首轮快速分配，返回前检查整个页为零，写入后按指定时间持有，再释放。 |
-| 向 `alloc` 写 `force COOKIE HOLD_US` | 已登记且池启用时跳过第一次快路径，用于注入慢请求。COOKIE 作为 trace 的 `parent`，范围为 64 位无符号数。 |
-| `test manual 1`、`test step`、`test manual 0` | 暂停自动授权，每步执行一个授权批次，随后恢复自动授权。补页独立工作。 |
-| `test hold 0\|1\|-1` | 暂停指定类已获得页的强制请求领取，或恢复领取。用于检验异序领取、撤销和停机。 |
-| `test fail_after N` | 允许 N 次池分配尝试后注入失败，`0` 立即失败，`-1` 清除。驱动初始化和补页共用此注入状态。 |
+| `enqueue`、`grant`、`claim`、`revoke` | 前台实体页的 grant/claim/revoke 共享同一页编号及授权序号。入队 ordinal 是全局入队序号。 |
+| `grant_permit`、`claim_permit`、`revoke_permit` | 后台许可字段 `page=0`。通过会话、请求号和授权序号关联。 |
+| 两种 `grant` | `detail=1` 是两类可同时服务时的轮转；`detail=0` 属于单类可服务。 |
+| `enter`、`return` | 量受控分配的端到端时延。return 的 `detail=2×path+success`，路径 0–4 为快、慢、池交付、准备失败、取消，5 为后台有许可的原生分配，6 为后台旁路后的原生分配。 |
+| `fallback`、`cancel`、两种 `revoke` | detail 为旁路／撤销原因。0–11 与旧接口相同，12 为 P 模式后台不能用池。 |
+| 池事件 | 新增 `reclaim_batch`、`pressure_pause` 与 `pressure_resume`，普通补页继续用 `refill_batch`。 |
 
-## 5　事件如何读
+E2 的匿名域父请求号仍待压力包联动，当前事件 `parent=0`。覆核时先确认一轮有自然前台慢路径、后台许可和池供给，然后再比较尾延迟、实际交付、旁路率与普通回收的变化。FGS 获得许可后有可能进入原生慢路径或直接回收，需要和许可排队时延分别观察。
 
-定义在 `include/trace/events/mem_alloc_qos.h`。诊断轮在 tracefs 使用 `mono` 时钟和 `events/mem_alloc_qos/enable`。保留原始轨迹、两端完整导出、各 CPU ring buffer 丢失计数及会话开始／停止回执。
+## 5　构建和验证
 
-| 事件 | 关联和字段 |
-|---|---|
-| `mem_qos_request` | 用 `session + id` 关联一次分配，用 `session + page` 关联一次池内持有期。字段含 `run`、`tid`、`role`（0=TOP，1=FGS）、`parent` 和 `phase`。 |
-| `enter`／`return` | 计算覆盖入口的全路径时延。enter 的 `detail=1` 是驱动强制样本。return 的 `detail = 2 × path + success`，path 依次为 0 快速、1 原生慢路径、2 池交付、3 原生准备失败、4 显式取消。 |
-| `enqueue`／`grant`／`resume`／`claim` | `ordinal` 在入队是全局入队序号，在授权和领取是同一个授权序号。grant 的 `detail=1` 代表两类同时有有效队首。`top`、`fgs` 是事件提交后的队长。 |
-| `fallback`／`cancel`／`revoke` | detail 依次为 0 原生、1 上下文、2 GFP、3 Zone/节点、4 空池、5 队满、6 描述符用尽、7 超时、8 信号、9 停机、10 显式取消、11 页属性变化。撤销记录原页和授权序号。 |
-| `mem_qos_pool` | 记录初始化、补页预留、批次结果、恢复、会话启停，字段包括 F/G/R、批量或实得页数、连续失败计数和批次耗时。池失败回执和 STOP 对账以 `status` 为准。 |
-
-会话的时延和路径计数仅覆盖已登记进程的受控调用。匿名域的 `parent=0`，E2 侧父触页 ID 仍需与负载包协同发布。也可以先按同一时钟的 TID 与窗口核查覆盖，无法唯一配对的单列。`resume` 记录等待谓词退出的时刻，可能是立即满足、授权通知、超时或信号触发。复盘调度唤醒延迟时，单列未睡眠和与授权并发的请求，用同一请求的 `grant`／`claim` 判定最终归属。当前内核实现提供授权队长、最大队首请求年龄、补页批次耗时及路径结果。独立的锁等待／持锁时长、空池区间自动汇总和应用侧时延分析仍由后续采集及分析补齐。
-
-## 6　构建与验证
-
-从 Pixel Kernel 工作区根目录构建 pantah。Kleaf 默认可能选下载的 GKI，需使用工作区定义的源码配置。
+从 Pixel Kernel 工作区根目录构建，使用本地 GKI 源码。
 
 ```sh
 tools/bazel run --config=use_source_tree_aosp --config=stamp --config=pantah \
     //private/devices/google/pantah:gs201_pantah_dist \
-    -- --dist_dir=out/pantah/memory-QoS
+    -- --dist_dir=out/pantah/memory-QoS-v2
 ```
 
-本次构建完成，产物位于工作区的 `out/pantah/memory-QoS/`。目录包含 `Image`、`boot.img`、`vendor_kernel_boot.img`、`dtbo.img` 和 `system_dlkm.img`。解包 `boot.img` 后，LZ4 内核解压得到的内容与通过 QEMU 自测的 `Image` 一致。`boot.img` 的 SHA-256 为 `8b9638d2a4271a749515e40927919be3ed7ead2d00368d2a506a3d29f5c75fd5`。构建配置确认启用了 QoS、4 KiB 基础页、内存热移除和 ZONE_DEVICE。
+Pixel 7 源码构建完成。`out/pantah/memory-QoS-v2/` 包含 `boot.img`、`vendor_kernel_boot.img`、`dtbo.img`、`system_dlkm.img` 和 `vendor_dlkm.img`。解包并解压 `boot.img` 的内核后，内容与通过 QEMU 自测的 `Image` 一致。`boot.img` 的 SHA-256 为 `ba8b1ef3c3b369ef646cf60909f01bad94002f598e10c52ae363625169b35b33`。构建配置启用 QoS、4 KiB 基础页、内存热移除和 ZONE_DEVICE。
 
-功能自测为 `tools/testing/selftests/vm/mem_alloc_qos.sh` 和同目录的 `mem_alloc_qos_worker.c`。测试内核启用 QoS、debugfs 和 tracefs 后，用目标架构工具链执行 `cc -O2 -pthread mem_alloc_qos_worker.c -o mem_alloc_qos_worker`，脚本和 worker 放同目录，以 root 执行。脚本使用独立的 trace 实例，运行完自动停止会话。
+`tools/testing/selftests/vm/mem_alloc_qos.sh` 与配套 worker 使用独立 trace 实例并在结束时停机对账。ARM64 lockdep/debug-list 内核连续通过三轮。覆盖前台专池、后台自动进队、FIFO、WRR 1–4∶1、池空时后台许可、回收后轮转续接、脏数据页重新清零、队满与超时旁路、未领许可与实体页撤销、清理及匿名入口。
 
-QEMU ARM64 virt 使用 2 vCPU、4 GiB RAM、4 KiB 基础页。4 GiB 确保该虚机有位于 4 GiB 地址线以上的 `ZONE_NORMAL` 内存。带 lockdep 和 `DEBUG_LIST` 的测试内核完整自测连续通过三轮。源码构建的 GKI `6.1.124-android14-11-g6243d7eb29ff` 也在启用 MTE 与硬件标签 KASAN 的虚机上通过了同一自测。关闭 `CONFIG_MEM_ALLOC_QOS` 后也单独编译验证了 `mm/page_alloc.o` 和 `mm/memory.o`。
+另在 224 MiB 的 ARM64 QEMU 上实测 `kswapd`。用 P 模式启动 8 页前台池，使用 `test fail_after 0` 注入普通补页失败。先让前台领空池子，再从只读 virtio/ext2 盘读取 384 MiB 文件形成文件缓存压力。三轮均靠真实回收触发，未调用 `test reclaim`。每轮 `reclaim=8`、`ordinary=0`，`pgsteal_kswapd` 从 0 增至 53,139–54,195，均记录一次水位暂停后恢复。前台再次领取八页时通过了整页清零检查，停机对账成立。
 
-| 测试计划 | 本次证据 |
-|---|---|
-| T04 | 检查运行中拒绝提交、非法低水位保留旧配置、部分初始化失败归还所有已取页。 |
-| T05 | N 的原生快速分配，P 的驱动池取页，以及已经注册的匿名页真实快速成功。其他约束域仍需设备逐项验证。 |
-| T06–T08 | 对照同页的 grant/claim/revoke，确认两个类可异序领取。检查 FIFO、WRR 1∶1 至 4∶1、单队游标冻结，以及池耗尽和恢复后 W3 的 2+2 页服务顺序。 |
-| T09–T11 | 补页失败、退避暂停、恢复。覆盖超时、队满、授权后显式取消，以及带在途队列和未领取授权的停机、页账与重启。 |
-| T12–T22 | QEMU 匿名测试覆盖入口和零填充。Pixel 7 的自然慢路径覆盖、E2/E3 性能及完整压力指标仍待真机测试。 |
+源码构建的 GKI `6.1.124-android14-11-g9222cb89417c` 在启用 MTE 和硬件标签 KASAN 的 QEMU 上也通过完整自测。用 GKI 配置关闭 QoS 后，也编译验证了页分配器、匿名缺页和回收对象。
 
-本机 `adb devices` 无设备，工作区和本机搜索均未找到配套的 Pixel7_T0_Gates_v39 脚本。E2/E3 没有在本次修改中运行。驱动的强制请求用于验证归属、顺序与并发，T14 的性能结论必须使用自然发生的请求。拿到压力包后先做 T02/T03 和 T13，确认匿名域的自然慢路径样本量及父子关联质量，再做 N/P/F/W1/W3 成对比较。
+本机无连接的 Pixel 7，E2/E3 真机收益与后台代价待实测。真实负载需额外记录前台池页命中、背景原生分配失败、`pgsteal_kswapd`、直接回收、Zone 水位及应用成功率。用 N、P、F、W1、W3 及旧版共用池提交做对照时，分别登记内核、策略和计数口径。原计划中的独立锁耗时与 E2 父子关联工具仍待采集侧补齐。
