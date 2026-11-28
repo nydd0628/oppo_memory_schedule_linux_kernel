@@ -95,6 +95,7 @@
 
 #include "pgalloc-track.h"
 #include "internal.h"
+#include "mem_alloc_qos.h"
 #include "swap.h"
 #include <trace/hooks/mm.h>
 
@@ -4266,7 +4267,18 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	/* Allocate our own private page. */
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
-	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
+#ifdef CONFIG_MEM_ALLOC_QOS
+	if (static_branch_unlikely(&mem_qos_anon_key) &&
+	    (vmf->flags & FAULT_FLAG_USER) && current->mm == vma->vm_mm) {
+		gfp_t gfp = QOS_ANON_GFP;
+
+		/* Match the arm64 anonymous allocation, including MTE. */
+		if (vma->vm_flags & VM_MTE)
+			gfp |= __GFP_ZEROTAGS;
+		page = mem_qos_alloc_pages(gfp, QOS_ANON, false, 0);
+	} else
+#endif
+		page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
 	if (!page)
 		goto oom;
 

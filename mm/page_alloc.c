@@ -83,6 +83,7 @@
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
 #include "internal.h"
+#include "mem_alloc_qos.h"
 #include "shuffle.h"
 #include "page_reporting.h"
 #include "swap.h"
@@ -5736,8 +5737,10 @@ EXPORT_SYMBOL_GPL(__alloc_pages_bulk);
 /*
  * This is the 'heart' of the zoned buddy allocator.
  */
-struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
-							nodemask_t *nodemask)
+static __always_inline struct page *
+alloc_pages_internal(gfp_t gfp, unsigned int order, int preferred_nid,
+		     nodemask_t *nodemask, struct mem_qos_call *qos,
+		     enum mem_qos_path *path)
 {
 	struct page *page;
 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
@@ -5772,7 +5775,15 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 	alloc_flags |= alloc_flags_nofragment(ac.preferred_zoneref->zone, gfp);
 
 	/* First allocation attempt */
-	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
+	page = NULL;
+#ifdef CONFIG_MEM_ALLOC_QOS
+	if (!qos || !qos->force)
+#endif
+		page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
+#ifdef CONFIG_MEM_ALLOC_QOS
+	if (qos && page)
+		*path = QOS_FAST;
+#endif
 	if (likely(page))
 		goto out;
 
@@ -5785,6 +5796,21 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 	 */
 	ac.nodemask = nodemask;
 
+#ifdef CONFIG_MEM_ALLOC_QOS
+	if (qos) {
+		page = mem_qos_slowpath(qos, gfp, ac.preferred_zoneref->zone);
+		if (IS_ERR(page)) {
+			*path = QOS_CANCELLED;
+			return NULL;
+		}
+		if (page) {
+			/* The pool allocated and initialized this page already. */
+			*path = QOS_POOL;
+			return page;
+		}
+		*path = QOS_SLOW;
+	}
+#endif
 	page = __alloc_pages_slowpath(alloc_gfp, order, &ac);
 
 out:
@@ -5799,7 +5825,30 @@ out:
 
 	return page;
 }
+
+struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+			   nodemask_t *nodemask)
+{
+	return alloc_pages_internal(gfp, order, preferred_nid, nodemask, NULL, NULL);
+}
 EXPORT_SYMBOL(__alloc_pages);
+
+#ifdef CONFIG_MEM_ALLOC_QOS
+struct page *mem_qos_alloc_pages(gfp_t gfp, enum mem_qos_domain domain,
+				 bool force, u64 parent)
+{
+	enum mem_qos_path path = QOS_REJECTED;
+	struct mem_qos_call call;
+	struct page *page;
+
+	if (!mem_qos_begin(&call, domain, force, parent))
+		return __alloc_pages(gfp, 0, numa_node_id(), NULL);
+
+	page = alloc_pages_internal(gfp, 0, numa_node_id(), NULL, &call, &path);
+	mem_qos_end(&call, path, !!page);
+	return path == QOS_CANCELLED ? ERR_PTR(-ECANCELED) : page;
+}
+#endif
 
 struct folio *__folio_alloc(gfp_t gfp, unsigned int order, int preferred_nid,
 		nodemask_t *nodemask)

@@ -52,6 +52,7 @@ TEST_GEN_FILES += userfaultfd
 TEST_GEN_PROGS += soft-dirty
 TEST_GEN_PROGS += split_huge_page_test
 TEST_GEN_FILES += ksm_tests
+TEST_GEN_FILES += mem_alloc_qos_worker
 
 ifeq ($(MACHINE),x86_64)
 CAN_BUILD_I386 := $(shell ./../x86/check_cc.sh "$(CC)" ../x86/trivial_32bit_program.c -m32)
@@ -87,7 +88,7 @@ TEST_GEN_FILES += virtual_address_range
 TEST_GEN_FILES += write_to_hugetlbfs
 endif
 
-TEST_PROGS := run_vmtests.sh
+TEST_PROGS := run_vmtests.sh mem_alloc_qos.sh
 
 TEST_FILES := test_vmalloc.sh
 TEST_FILES += test_hmm.sh

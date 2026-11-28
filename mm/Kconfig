@@ -1224,6 +1224,18 @@ config LOCK_MM_AND_FIND_VMA
 	bool
 	depends on !STACK_GROWSUP
 
+config MEM_ALLOC_QOS
+	bool "Experimental allocation QoS for registered tasks"
+	depends on ARM64 && MMU && !NUMA && HIGH_RES_TIMERS && TRACING
+	select DEBUG_FS
+	help
+	  Add a root-controlled page pool and a two-class allocator for
+	  order-0 experiments. Sessions are stopped at boot. Only the test
+	  driver and explicitly registered private anonymous faults can use it.
+	  Controls and statistics are available under debugfs/mem_alloc_qos.
+
+	  If unsure, say N.
+
 source "mm/damon/Kconfig"
 
 endmenu
