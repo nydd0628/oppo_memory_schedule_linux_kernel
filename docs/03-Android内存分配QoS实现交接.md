@@ -1,8 +1,8 @@
 # Android 内存分配 QoS 实现交接
 
-**V2 · 前台专池与后台分配许可 · Pixel 7（pantah）· 分支 `memory-QoS`**
+**V3 · 同步回收补池与在线调容 · Pixel 7（pantah）· 分支 `memory-QoS`**
 
-内核基线是 `6.1.124-android14-11-g8769cc47188c`。旧实验提交 `6243d7eb29ff` 的前后台共用一个池，双方都在原生快路径失败后排队。当前实现提交 `9222cb89417c` 改为前台专池、后台许可和 `kswapd` 回收补池。原设计和用例可查 01、02，涉及后台入口和授权定义的地方以本文为准。[原详细设计](01-Android内存分配QoS详细设计.md) · [原测试计划](02-Android内存分配QoS测试计划.md)
+内核基线是 `6.1.124-android14-11-g8769cc47188c`。V1 提交 `6243d7eb29ff` 使用前后台共用池。V2 提交 `9222cb89417c` 引入前台专池、后台许可和 `kswapd` 回收补池。V3 提交 `f3abdb17adf6` 进一步接入符合条件的直接回收和 memcg 回收，并支持在线手动、自动调容。原设计和用例可查 01、02，当前行为以本文为准。[原详细设计](01-Android内存分配QoS详细设计.md) · [原测试计划](02-Android内存分配QoS测试计划.md)
 
 ## 1　申请从哪里进入
 
@@ -33,12 +33,18 @@ TOP 可服务需要队首未过期且池里有兼容页。FGS 可服务需要队
 ## 3　刚回收的页怎么补进池
 
 1. **启动。** 复用原生无直接回收分配，分批预填到目标。部分失败时全量归还，服务保持 OFF。
-2. **优先接收回收页。** `mm/vmscan.c` 的 `shrink_folio_list()` 仅对全局 `kswapd` 回收的 order-0 释放批次，完成 memcg 解账和 TLB flush 后进入 QoS 释放链。普通直接回收、限定 memcg 回收和其他释放入口沿用原生流程。
+2. **优先接收回收页。** `mm/vmscan.c` 的 `shrink_folio_list()` 在 memcg 解账和 TLB flush 后，把这三个来源的合格单页批次送入 QoS 释放链。来源为全局 `kswapd`、普通 order-0 且可以从 `ZONE_NORMAL` 获取页的分配直接回收，以及 memcg LRU 回收。高阶分配触发的直接回收、特殊储备和休眠回收沿用原生路径。同步回收每次候选链至少保留一张可供普通分配的相容页，只有一张时全量交回原生路径。
 3. **在普通链之前接收。** `mm/page_alloc.c` 运行原有释放准备，再在进 PCP／buddy 前择取兼容页，直到池达到目标或这批候选用完。跳过硬件坏页、已隔离页块、CMA 和紧急储备类型。接收时用 `prep_new_page()` 恢复分配状态，处理零填充、KASAN、架构检查和页引用。池准备之外的剩余页继续走普通释放路径。
 4. **普通内存的保护线。** 普通空闲内存过不了 Zone MIN 检查时暂停补池，过了 LOW 检查再恢复。有余量时才收回收页。普通补页工作作为备用来源，只在预计扣掉本批后仍过得了 HIGH 检查时从原生分配器补。备用源本身不发起回收。达到普通补页连续失败上限时会暂停，成功接收回收页或执行 `recover` 可复位失败状态。水位约束仍独立生效。
-5. **回收进度对账。** 一批实际转入前台池的页从这次 `nr_reclaimed` 中扣除。池账独立记录每种来源。`kswapd` 按普通分配器实际得到的页计算回收进度，进度不足时沿用原有的回收判断。
+5. **回收进度对账。** 全局 `kswapd` 和分配触发的直接回收会从 `nr_reclaimed` 扣除转入前台池的页。普通分配器按实际得到的页计算进度，进度不足时沿用原有回收判断。memcg 回收按原有解账计进度，因为页已从目标组的用量中移除。池的物理页账和 memcg 解账分别核对。
 
-`F` 为空闲池页，`G` 为前台已授权未领的页，`R` 为补页预留槽，`retiring` 为准备还给普通分配器的页。合计受目标和最大容量约束。静止时 `obtained = F + G + delivered + returned`，有待退页时右侧加 `retiring`。停机检查 F/G/R/retiring 和 `live` 清零及 `balanced=1`。FGS 许可另有 `permits_pending` 和 `permits_used`，不占池容量，停机后 pending 也清零。
+`F` 为空闲池页，`G` 为前台已授权未领的页，`R` 为补页预留槽，`retiring` 为准备还给普通分配器的页。补页以四者的合计作为占用。目标调低时优先分批退还空闲页，已授权页可正常领取，在途补页会按新目标重新核对。缩容收敛前占用可以暂时高于目标，会话最大容量继续约束所有预留和持有。静止时 `obtained = F + G + delivered + returned`，有待退页时右侧加 `retiring`。停机检查 F/G/R/retiring 和 `live` 清零及 `balanced=1`。FGS 许可另有 `permits_pending` 和 `permits_used`，不占池容量，停机后 pending 也清零。
+
+### 在线容量和水位
+
+- 起始 `TARGET` 与预设 `MAX` 来自启动配置。`MAX` 上限为 1024 页，在 4 KiB 页上是 4 MiB。自动调容默认关闭，`target N` 在线修改目标，范围为 1 到会话 `MAX`。增大目标会请求补页并继续遵守供给保护线。缩小时先还空闲页，之后在途页退出时继续收敛。普通补页触发的池内低线取原配置 `LOW` 与当前目标的较小值。
+- `auto MIN MAX` 在活动的 P/F/W 会话开启自动调容，要求 `1 ≤ MIN ≤ 当前目标 ≤ MAX ≤ 会话最大容量`。自动每约 250 ms 查看前台合格请求和空池情况。空池出现前台需求、水位通过 HIGH 且扣除本次增量后仍满足 HIGH 时，目标最多翻倍，受自动上限约束。约 1 秒都没有合格前台需求且水位通过 HIGH 时，目标最多减半，受自动下限约束。
+- 水位过不了调容检查时，`auto frozen=1`，当前目标和已有库存保留。前台仍可领取库存，补页继续按 Zone MIN/LOW 防护线判断。水位回升后重新采样决定调整。`auto off` 停止自动工作并保留当时的目标，随后可用 `target N`。关闭会话后重新 `start` 会恢复启动配置，自动调容需重新开启。
 
 Apple 公开的 XNU 将 *secluded memory* 用于改善内存紧张时的相机启动。此次借鉴了按用途隔离的少量库存，以及用不同水位暂停和恢复的思路。TOP/FGS 身份、W3 两类轮转、后台许可和回退规则属于本实验。XNU 按进程优先级处理内存压力的 Jetsam、应用冻结和压缩属于另一个控制层，留作独立对照。[XNU 专池与 Jetsam](https://github.com/apple-oss-distributions/xnu/blob/main/doc/vm/memorystatus.md#memory-monitoring) · [XNU 压力阈值](https://github.com/apple-oss-distributions/xnu/blob/main/doc/vm/memorystatus_notify.md#pressure-thresholds)
 
@@ -52,13 +58,16 @@ start
 stop
 recover
 cancel SESSION REQUEST_ID
+target PAGES
+auto MIN MAX
+auto off
 ```
 
 | 参数 | 规则 |
 |---|---|
 | MODE，DOMAIN | MODE 为 0=N、1=P、2=F、3=W。DOMAIN 为 0=driver、1=anon。N 的池和队列字段为零，P 的队列字段为零。 |
 | 权重 | 仅 W 非零，TOP 1–4、FGS 1。F 比较两个可服务队首的入队序号。 |
-| 池 | `0 < low < target ≤ max ≤ 128`。启动和补页批量 1–16，退避 500–8000 μs，普通补页失败上限 1–8 批。 |
+| 池 | 启动时 `0 < low < target ≤ max ≤ 1024`。启动和补页批量 1–16，退避 500–8000 μs，普通补页失败上限 1–8 批。 |
 | 排队 | 每类深度 1–64，授予批量 1–8。匿名域预算 100–1000 μs，驱动域最长 1,000,000 μs 供诊断。 |
 | 采集与身份 | TRACE 为 0 核心计数、1 加路径计数、2 加请求事件。后台许可实际成功及旁路结果在所有档位计数。RUN_ID 为非零 64 位整数，两个 TGID 需存活且不同。 |
 
@@ -66,18 +75,23 @@ cancel SESSION REQUEST_ID
 
 ```sh
 q=/sys/kernel/debug/mem_alloc_qos
-printf 'config 3 1 3 1 32 32 16 4 4 1000 3 64 250 1 1 36001 %s %s\n' \
+printf 'config 3 1 3 1 32 1024 16 4 4 1000 3 64 250 1 1 36001 %s %s\n' \
     "$top_tgid" "$fgs_tgid" > "$q/control"
 printf 'start\n' > "$q/control"
+printf 'auto 16 256\n' > "$q/control"
+cat "$q/status"
+# 需要固定目标做对照时关闭自动调容。
+printf 'auto off\n' > "$q/control"
+printf 'target 128\n' > "$q/control"
 cat "$q/status"
 # 在负载完成后保存最后一次状态。
 printf 'stop\n' > "$q/control"
 cat "$q/status"
 ```
 
-`status` 的 `refill_sources` 区分 `reclaim`、`ordinary` 和水位暂停，启动预填数量单列为 `initialized`。后台的 `grants` 是授权次数，`permits_used` 是领取次数，`permitted_ok/fail` 是持许可进入原生分配器的结果。`fgs_bypass` 原因行与 `fgs_bypass_ok/fail` 结果分开保存。上面的 `claimed` 只计实体池页，后台应为零。
+`status` 的 `pool_target` 是当前在线目标。`auto` 回执行给出启停、冻结、容量区间、扩缩次数、前台池尝试和空池次数。`refill_sources` 的 `reclaim` 是 `kswapd`、`direct`、`memcg` 的和，`ordinary` 是备用补页，启动预填数量单列为 `initialized`。后台的 `grants` 是授权次数，`permits_used` 是领取次数，`permitted_ok/fail` 是持许可进入原生分配器的结果。`fgs_bypass` 原因行与 `fgs_bypass_ok/fail` 结果分开保存。上面的 `claimed` 只计实体池页，后台应为零。
 
-`driver` 域可向 `alloc` 写 `auto COOKIE HOLD_US` 或 `force COOKIE HOLD_US`。驱动会检查整页清零，写入内容，持有指定时间再释放。force 可以让前台跳过首次快路径用于诊断，后台在 F/W 使用 auto 就会进许可队列。诊断命令 `test manual 1`、`test step`、`test hold ROLE`、`test fail_after N` 用于控制授权、领取和普通补页。新增 `test reclaim N` 以 N 张写过数据的驱动页走同一条释放准备、接收和重新初始化路径。这些人工页也计入 `reclaim`，正式追回收来源的运行使用自然压力并关闭人工注入。
+`driver` 域可向 `alloc` 写 `auto COOKIE HOLD_US` 或 `force COOKIE HOLD_US`。驱动会检查整页清零，写入内容，持有指定时间再释放。force 可以让前台跳过首次快路径用于诊断，后台在 F/W 使用 auto 就会进许可队列。`test manual 1`、`test step`、`test hold ROLE`、`test fail_after N` 用于控制授权、领取和普通补页。`test reclaim N`、`test reclaim_direct N`、`test reclaim_memcg N` 以写过数据的驱动页跑对应来源的释放准备、接收和重新初始化。这些人工页计入来源统计，正式压力数据需关闭人工注入。
 
 ### 事件
 
@@ -87,10 +101,10 @@ cat "$q/status"
 |---|---|
 | `enqueue`、`grant`、`claim`、`revoke` | 前台实体页的 grant/claim/revoke 共享同一页编号及授权序号。入队 ordinal 是全局入队序号。 |
 | `grant_permit`、`claim_permit`、`revoke_permit` | 后台许可字段 `page=0`。通过会话、请求号和授权序号关联。 |
-| 两种 `grant` | `detail=1` 是两类可同时服务时的轮转；`detail=0` 属于单类可服务。 |
+| 两种 `grant` | `detail=1` 是两类可同时服务时的轮转。`detail=0` 属于单类可服务。 |
 | `enter`、`return` | 量受控分配的端到端时延。return 的 `detail=2×path+success`，路径 0–4 为快、慢、池交付、准备失败、取消，5 为后台有许可的原生分配，6 为后台旁路后的原生分配。 |
 | `fallback`、`cancel`、两种 `revoke` | detail 为旁路／撤销原因。0–11 与旧接口相同，12 为 P 模式后台不能用池。 |
-| 池事件 | 新增 `reclaim_batch`、`pressure_pause` 与 `pressure_resume`，普通补页继续用 `refill_batch`。 |
+| 池事件 | `reclaim_batch`、`direct_batch`、`memcg_batch` 区分回收页来源。`pressure_pause` 与 `pressure_resume` 对应补页水位。`auto_freeze`、`auto_resume`、`auto_grow`、`auto_shrink` 对应自动调容。`target` 记录手动目标，`trim` 记录归还批次。 |
 
 E2 的匿名域父请求号仍待压力包联动，当前事件 `parent=0`。覆核时先确认一轮有自然前台慢路径、后台许可和池供给，然后再比较尾延迟、实际交付、旁路率与普通回收的变化。FGS 获得许可后有可能进入原生慢路径或直接回收，需要和许可排队时延分别观察。
 
@@ -101,15 +115,15 @@ E2 的匿名域父请求号仍待压力包联动，当前事件 `parent=0`。覆
 ```sh
 tools/bazel run --config=use_source_tree_aosp --config=stamp --config=pantah \
     //private/devices/google/pantah:gs201_pantah_dist \
-    -- --dist_dir=out/pantah/memory-QoS-v2
+    -- --dist_dir=out/pantah/memory-QoS-v3
 ```
 
-Pixel 7 源码构建完成。`out/pantah/memory-QoS-v2/` 包含 `boot.img`、`vendor_kernel_boot.img`、`dtbo.img`、`system_dlkm.img` 和 `vendor_dlkm.img`。解包并解压 `boot.img` 的内核后，内容与通过 QEMU 自测的 `Image` 一致。`boot.img` 的 SHA-256 为 `ba8b1ef3c3b369ef646cf60909f01bad94002f598e10c52ae363625169b35b33`。构建配置启用 QoS、4 KiB 基础页、内存热移除和 ZONE_DEVICE。
+现有 `out/pantah/memory-QoS-v2/` 镜像对应 V2。V3 编译验证了 ARM64 GKI 的 `mm/page_alloc.o`、`mm/vmscan.o`、`mm/memory.o` 和 `mm/mem_alloc_qos.o`，另构建并启动了 QEMU 测试内核。关闭 QoS 编译选项时，也验证了页分配器、匿名缺页和回收对象。
 
-`tools/testing/selftests/vm/mem_alloc_qos.sh` 与配套 worker 使用独立 trace 实例并在结束时停机对账。ARM64 lockdep/debug-list 内核连续通过三轮。覆盖前台专池、后台自动进队、FIFO、WRR 1–4∶1、池空时后台许可、回收后轮转续接、脏数据页重新清零、队满与超时旁路、未领许可与实体页撤销、清理及匿名入口。
+`tools/testing/selftests/vm/mem_alloc_qos.sh` 在 ARM64 lockdep/debug-list 测试内核连续通过三轮。新增用例覆盖目标 8→256→2、自动扩缩、开启自动时拒绝手动目标、关闭后切回手动、缩容期间已有授权的领取及撤销、同步回收只有一张相容页时留给原生分配器，另外重跑了旧版两类授权、清零和停机对账用例。
 
-另在 224 MiB 的 ARM64 QEMU 上实测 `kswapd`。用 P 模式启动 8 页前台池，使用 `test fail_after 0` 注入普通补页失败。先让前台领空池子，再从只读 virtio/ext2 盘读取 384 MiB 文件形成文件缓存压力。三轮均靠真实回收触发，未调用 `test reclaim`。每轮 `reclaim=8`、`ordinary=0`，`pgsteal_kswapd` 从 0 增至 53,139–54,195，均记录一次水位暂停后恢复。前台再次领取八页时通过了整页清零检查，停机对账成立。
+在 224 MiB 的 ARM64 QEMU 调整真实 Zone 水位后，观测到自动调容冻结，8 页目标与空闲库存保留，恢复水位后解除冻结。普通补页测试源关闭时，用 `memory.reclaim` 从 memcg 回收的真实页补回 8 页，再用文件缓存压力触发的 `kswapd` 补回另 8 页，普通补页计数为零。
 
-源码构建的 GKI `6.1.124-android14-11-g9222cb89417c` 在启用 MTE 和硬件标签 KASAN 的 QEMU 上也通过完整自测。用 GKI 配置关闭 QoS 后，也编译验证了页分配器、匿名缺页和回收对象。
+直接回收另用隔离的 QEMU 测试内核受控调用原生 `try_to_free_pages()`。读取 64 MiB 文件建立可回收缓存后，真实全局直接回收从空池补回 8 页，`direct=8`，`pgsteal_direct` 从 0 增到 52，清零和停机对账都通过。编入临时测试内核的入口只用于触发回收。自然压力轮的 `direct=0`，仍需在实际分配失败负载中测量命中和代价。
 
 本机无连接的 Pixel 7，E2/E3 真机收益与后台代价待实测。真实负载需额外记录前台池页命中、背景原生分配失败、`pgsteal_kswapd`、直接回收、Zone 水位及应用成功率。用 N、P、F、W1、W3 及旧版共用池提交做对照时，分别登记内核、策略和计数口径。原计划中的独立锁耗时与 E2 父子关联工具仍待采集侧补齐。
