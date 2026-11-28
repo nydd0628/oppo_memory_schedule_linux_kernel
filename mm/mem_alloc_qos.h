@@ -16,6 +16,14 @@ enum mem_qos_role {
 	QOS_ROLES,
 };
 
+enum mem_qos_reclaim_source {
+	QOS_RECLAIM_NONE,
+	QOS_RECLAIM_KSWAPD,
+	QOS_RECLAIM_DIRECT,
+	QOS_RECLAIM_MEMCG,
+	QOS_RECLAIM_SOURCES,
+};
+
 #define QOS_DRIVER_GFP	(GFP_KERNEL | __GFP_ZERO)
 #define QOS_ANON_GFP	(GFP_HIGHUSER_MOVABLE | __GFP_ZERO | __GFP_CMA | __GFP_COMP)
 
@@ -54,9 +62,12 @@ bool mem_qos_begin(struct mem_qos_call *call, enum mem_qos_domain domain,
 void mem_qos_end(struct mem_qos_call *call, enum mem_qos_path path, bool success);
 struct page *mem_qos_request(struct mem_qos_call *call, gfp_t gfp,
 			     struct zone *preferred_zone);
-unsigned int mem_qos_capture_reclaimed(struct list_head *pages);
-bool mem_qos_prepare_reclaimed(struct page *page, gfp_t gfp);
-unsigned int free_unref_page_list_qos(struct list_head *pages);
+unsigned int mem_qos_capture_reclaimed(struct list_head *pages,
+				       enum mem_qos_reclaim_source source);
+bool mem_qos_reclaimed_eligible(struct page *page);
+void mem_qos_prepare_reclaimed(struct page *page, gfp_t gfp);
+unsigned int free_unref_page_list_qos(struct list_head *pages,
+				     enum mem_qos_reclaim_source source);
 
 #endif
 #endif

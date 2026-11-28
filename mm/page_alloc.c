@@ -2630,20 +2630,21 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 
 #ifdef CONFIG_MEM_ALLOC_QOS
 /* The reclaim free path has already run free_unref_page_prepare(). */
-bool mem_qos_prepare_reclaimed(struct page *page, gfp_t gfp)
+bool mem_qos_reclaimed_eligible(struct page *page)
 {
 	struct zone *zone = page_zone(page);
 	int mt = get_pageblock_migratetype(page);
 
-	if (zone_idx(zone) != ZONE_NORMAL || has_isolate_pageblock(zone) ||
-	    PageHWPoison(page) || page_count(page) ||
-	    !migratetype_is_mergeable(mt) || mt != get_pcppage_migratetype(page))
-		return false;
+	return zone_idx(zone) == ZONE_NORMAL && !has_isolate_pageblock(zone) &&
+	       !PageHWPoison(page) && !page_count(page) &&
+	       migratetype_is_mergeable(mt) && mt == get_pcppage_migratetype(page);
+}
 
+void mem_qos_prepare_reclaimed(struct page *page, gfp_t gfp)
+{
 	list_del_init(&page->lru);
 	prep_new_page(page, 0, gfp, 0);
 	kmsan_alloc_page(page, 0, gfp);
-	return true;
 }
 #endif
 
@@ -3680,7 +3681,7 @@ void free_unref_page(struct page *page, unsigned int order)
  * Free a list of 0-order pages
  */
 static __always_inline unsigned int
-free_unref_page_list_internal(struct list_head *list, bool qos_reclaim)
+free_unref_page_list_internal(struct list_head *list, enum mem_qos_reclaim_source source)
 {
 	unsigned long __maybe_unused UP_flags;
 	struct page *page, *next;
@@ -3711,8 +3712,8 @@ free_unref_page_list_internal(struct list_head *list, bool qos_reclaim)
 	}
 
 #ifdef CONFIG_MEM_ALLOC_QOS
-	if (qos_reclaim)
-		captured = mem_qos_capture_reclaimed(list);
+	if (source != QOS_RECLAIM_NONE)
+		captured = mem_qos_capture_reclaimed(list, source);
 #endif
 
 	list_for_each_entry_safe(page, next, list, lru) {
@@ -3778,13 +3779,13 @@ free_unref_page_list_internal(struct list_head *list, bool qos_reclaim)
 
 void free_unref_page_list(struct list_head *list)
 {
-	free_unref_page_list_internal(list, false);
+	free_unref_page_list_internal(list, QOS_RECLAIM_NONE);
 }
 
 #ifdef CONFIG_MEM_ALLOC_QOS
-unsigned int free_unref_page_list_qos(struct list_head *list)
+unsigned int free_unref_page_list_qos(struct list_head *list, enum mem_qos_reclaim_source source)
 {
-	return free_unref_page_list_internal(list, true);
+	return free_unref_page_list_internal(list, source);
 }
 #endif
 

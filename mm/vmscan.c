@@ -134,6 +134,9 @@ struct scan_control {
 	unsigned int memcg_low_skipped:1;
 
 	unsigned int hibernation_mode:1;
+#ifdef CONFIG_MEM_ALLOC_QOS
+	unsigned int qos_alloc_reclaim:1;
+#endif
 
 	/* One of the zones is ready for compaction */
 	unsigned int compaction_ready:1;
@@ -2145,11 +2148,23 @@ keep:
 	mem_cgroup_uncharge_list(&free_folios);
 	try_to_unmap_flush();
 #ifdef CONFIG_MEM_ALLOC_QOS
-	if (static_branch_unlikely(&mem_qos_reclaim_key) && current_is_kswapd() &&
-	    global_reclaim(sc))
-		/* Reserved pages are unavailable to the ordinary allocator. */
-		nr_reclaimed -= free_unref_page_list_qos(&free_folios);
-	else
+	if (static_branch_unlikely(&mem_qos_reclaim_key) && !sc->hibernation_mode &&
+	    (current_is_kswapd() || sc->qos_alloc_reclaim || cgroup_reclaim(sc))) {
+		enum mem_qos_reclaim_source source;
+		unsigned int captured;
+
+		if (current_is_kswapd() && global_reclaim(sc))
+			source = QOS_RECLAIM_KSWAPD;
+		else if (cgroup_reclaim(sc))
+			source = QOS_RECLAIM_MEMCG;
+		else
+			source = QOS_RECLAIM_DIRECT;
+
+		captured = free_unref_page_list_qos(&free_folios, source);
+		/* Memcg reclaim made progress when it removed the cgroup charge. */
+		if (source != QOS_RECLAIM_MEMCG)
+			nr_reclaimed -= captured;
+	} else
 #endif
 		free_unref_page_list(&free_folios);
 
@@ -7156,6 +7171,10 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.gfp_mask = current_gfp_context(gfp_mask),
 		.reclaim_idx = gfp_zone(gfp_mask),
 		.order = order,
+#ifdef CONFIG_MEM_ALLOC_QOS
+		.qos_alloc_reclaim = order == 0 && gfp_zone(gfp_mask) >= ZONE_NORMAL &&
+				     !(gfp_mask & (__GFP_MEMALLOC | __GFP_HIGH | __GFP_NOFAIL)),
+#endif
 		.nodemask = nodemask,
 		.priority = DEF_PRIORITY,
 		.may_writepage = !laptop_mode,

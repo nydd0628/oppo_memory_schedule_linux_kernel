@@ -137,6 +137,83 @@ await_line "$tmp/out1" '^14=0$'
 expect 'role=1 .* claimed=0 .*fast_ok=1 .*pool_ok=0'
 stop
 
+run=15
+setup 1 0 0 0 8 1024 4 4 4 1000 3 0 0 0
+control target 256
+await_line "$qos/status" 'pool F=256 G=0 R=0'
+expect 'pool_target pages=256 max=1024'
+control target 2
+await_line "$qos/status" 'pool F=2 G=0 R=0 retiring=0'
+stop
+
+run=16
+setup 1 0 0 0 2 8 1 4 4 1000 3 0 0 0
+control test fail_after 0
+for i in 161 162; do
+	submit 0 force "$i"
+	await_line "$tmp/out0" "^$i=0$"
+done
+control test reclaim_direct 1
+expect 'pool F=0 G=0 R=0 retiring=0'
+expect 'kswapd=0 direct=0 memcg=0'
+control test reclaim_direct 2
+expect 'pool F=1 G=0 R=0 retiring=0'
+expect 'kswapd=0 direct=1 memcg=0'
+control test reclaim_memcg 2
+expect 'pool F=2 G=0 R=0 retiring=0'
+expect 'kswapd=0 direct=1 memcg=1'
+for i in 163 164; do
+	submit 0 force "$i"
+	await_line "$tmp/out0" "^$i=0$"
+done
+stop
+control test fail_after -1
+
+run=17
+setup 1 0 0 0 2 16 1 4 4 1000 3 0 0 0
+control auto 1 16
+if control target 8 2>/dev/null; then
+	fail 'manual resize was accepted with auto enabled'
+fi
+control test fail_after 0
+for i in 171 172 173; do
+	submit 0 force "$i"
+	await_line "$tmp/out0" "^$i=0$"
+done
+await_line "$qos/status" 'pool_target pages=4'
+await_line "$qos/status" 'pool_target pages=2'
+expect 'auto enabled=1 frozen=0 min=1 max=16 grows=1 shrinks=1'
+control auto off
+control target 8
+expect 'auto enabled=0'
+expect 'pool_target pages=8'
+stop
+control test fail_after -1
+
+run=18
+setup 3 0 3 1 4 8 2 4 4 1000 3 16 1000000 1
+control test manual 1
+control test hold 0
+submit 0 force 181
+await_line "$qos/status" 'queue top=1 fgs=0'
+submit 0 force 182
+await_line "$qos/status" 'queue top=2 fgs=0'
+control test step
+control test step
+expect 'pool F=2 G=2 R=0 '
+control target 1
+await_line "$qos/status" 'pool F=0 G=2 R=0 retiring=0'
+generation=$(sed -n 's/.* state=ACTIVE session=\([0-9]*\)$/\1/p' "$qos/status")
+id=$(sed -n 's/.*run=18 .* id=\([0-9]*\) parent=181 .*phase=grant .*/\1/p' "$trace/trace")
+[ -n "$generation" ] && [ -n "$id" ] || fail 'missing page grant during resize'
+control cancel "$generation" "$id"
+await_line "$tmp/out0" '^181=125$'
+await_line "$qos/status" 'pool F=0 G=1 R=0 retiring=0'
+control test hold -1
+await_line "$tmp/out0" '^182=0$'
+await_line "$qos/status" 'pool F=1 G=0 R=0 retiring=0'
+stop
+
 run=20
 setup 2 0 0 0 8 8 4 4 4 1000 3 16 1000000 1
 control test manual 1
@@ -348,4 +425,4 @@ awk '
 			exit 1
 	}
 ' "$trace/trace" || fail 'trace page ownership'
-echo 'PASS: TOP pool, FGS permits, WRR/FIFO, reclaim, bypass, cancel, stop, anon'
+echo 'PASS: TOP pool, FGS permits, resize, WRR/FIFO, reclaim, bypass, cancel, stop, anon'
